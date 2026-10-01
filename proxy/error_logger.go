@@ -113,4 +113,5 @@ func logUpstreamError(endpoint string, statusCode int, model string, accountID i
 func CloseErrorLogger() {
 	badRequestLogger.close()
 	serverErrorLogger.close()
+	excelBPSLogger.close()
 }

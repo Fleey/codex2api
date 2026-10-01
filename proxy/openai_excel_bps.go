@@ -4,18 +4,22 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -24,6 +28,7 @@ import (
 	"github.com/codex2api/proxy/basispoints"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // excelBPSReplay may be backed by the shared runtime cache; it serves only
@@ -67,6 +72,12 @@ var excelBPSDo = func(req *http.Request, account *auth.Account, proxyURL string)
 type excelBPSHTTPError struct {
 	status int
 	code   string // Provider code only; never retain the upstream message or body.
+	// rateLimit is the client-safe notice of a 429, carrying only the retry
+	// delay; retryAfter is that delay, or 0 when the provider named none.
+	rateLimit  string
+	retryAfter time.Duration
+	// gaveUp marks a rate limit the request already waited out in vain.
+	gaveUp bool
 }
 
 func (e *excelBPSHTTPError) Error() string {
@@ -95,6 +106,50 @@ type excelBPSUpstream struct {
 	response *http.Response
 	bridge   *basispoints.Bridge
 	model    string
+	// encrypted scopes this conversation's rejected encrypted reasoning, and
+	// digests lists the encrypted items the accepted body carried.
+	encrypted encryptedScopeKey
+	digests   []encryptedDigest
+}
+
+// rejectEncrypted remembers that the upstream could not read the encrypted
+// reasoning this request carried, so the next attempt leaves it out. It
+// reports false when there was none, since a retry would change nothing.
+func (u *excelBPSUpstream) rejectEncrypted() bool {
+	if u == nil || len(u.digests) == 0 {
+		return false
+	}
+	rejectedEncryptedContent.mark(u.encrypted, u.digests)
+	return true
+}
+
+// excelBPSEncryptedScope namespaces the encrypted reasoning BPS rejected by
+// account credential and conversation. Reasoning another account or the
+// native backend encrypted cannot be read here, and the client resends it
+// with every later turn of the conversation.
+func excelBPSEncryptedScope(account *auth.Account, scope string) encryptedScopeKey {
+	return encryptedScopeKey{
+		keyIdentity: "excel-bps",
+		account:     account.ID(),
+		generation:  account.GetCredentialGeneration(),
+		session:     sha256.Sum256([]byte(scope)),
+	}
+}
+
+// excelBPSToolImagesRefusedAt records, as Unix nanoseconds, when BPS last
+// refused tool-result images sent inline and then accepted them uploaded.
+// Later requests upload them from the start instead of spending a refused
+// request to learn it again; after excelBPSToolImagesRefusalTTL the inline
+// form is tried again in case the backend changed.
+var excelBPSToolImagesRefusedAt atomic.Int64
+
+const excelBPSToolImagesRefusalTTL = 24 * time.Hour
+
+func excelBPSInitialImageMode() basispoints.ImageMode {
+	if at := excelBPSToolImagesRefusedAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < excelBPSToolImagesRefusalTTL {
+		return basispoints.ImagesUploadAll
+	}
+	return basispoints.ImagesDefault
 }
 
 // ExcelBPSResponse is the response returned by ExecuteExcelBPSRequest. The
@@ -127,6 +182,21 @@ var excelBPSClientHeaders = [][2]string{
 	{"X-Stainless-Runtime", "browser:chrome"},
 }
 
+// excelBPSUserAgentEnv overrides the browser User-Agent the add-in's WebView2
+// host would send, should the backend ever start checking it.
+const excelBPSUserAgentEnv = "CODEX_EXCEL_BPS_USER_AGENT"
+
+// excelBPSDefaultUserAgent is desktop Excel's WebView2 (Edge) on Windows, the
+// host the PC/desktop client headers above describe.
+const excelBPSDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
+
+func excelBPSUserAgent() string {
+	if value := strings.TrimSpace(os.Getenv(excelBPSUserAgentEnv)); value != "" {
+		return value
+	}
+	return excelBPSDefaultUserAgent
+}
+
 // setExcelBPSHeaders applies the account credentials and the Excel add-in
 // client identity shared by Responses and attachment requests. Callers set
 // Content-Type and Accept for their own body.
@@ -134,8 +204,13 @@ func setExcelBPSHeaders(req *http.Request, token, accountID string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Chatgpt-Account-Id", accountID)
 	req.Header.Set("X-Openai-Account-Id", accountID)
+	// The add-in names the signed-in user of the account too; the value comes
+	// from the same token, so it cannot disagree with the credentials.
+	if claims := auth.ParseAccessToken(token); claims != nil && claims.ChatGPTAccountUserID != "" {
+		req.Header.Set("X-Openai-Account-User-Id", claims.ChatGPTAccountUserID)
+	}
 	req.Header.Set("Origin", "https://bps.openai.com")
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", excelBPSUserAgent())
 	for _, header := range excelBPSClientHeaders {
 		req.Header.Set(header[0], header[1])
 	}
@@ -270,7 +345,7 @@ var excelBPSImageExtensions = map[string]string{"image/png": "png", "image/jpeg"
 // uploadExcelBPSImage uploads one image the way the Excel add-in's "Upload
 // file" button does and returns the OpenAI file ID the Responses body names.
 // mediaType has been validated as a plain image/* token by basispoints.
-func uploadExcelBPSImage(ctx context.Context, account *auth.Account, proxyURL, token, accountID, mediaType string, data []byte, digest string) (string, error) {
+func uploadExcelBPSImage(ctx context.Context, account *auth.Account, proxyURL, token, accountID, mediaType string, data []byte, digest, tag string) (string, error) {
 	extension := excelBPSImageExtensions[mediaType]
 	if extension == "" {
 		extension = "png"
@@ -307,14 +382,14 @@ func uploadExcelBPSImage(ctx context.Context, account *auth.Account, proxyURL, t
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		log.Printf("[excel-bps] account=%d attachment upload HTTP %d: %s", account.ID(), response.StatusCode, excelBPSErrorShape(payload))
+		basispoints.Logf("%s attachment upload HTTP %d: %s", tag, response.StatusCode, excelBPSErrorShape(payload))
 		return "", fmt.Errorf("attachment upload returned HTTP %d", response.StatusCode)
 	}
 	fileID := strings.TrimSpace(gjson.GetBytes(payload, "openai_file_id").String())
 	if fileID == "" {
 		return "", errors.New("attachment upload returned no file ID")
 	}
-	log.Printf("[excel-bps] account=%d uploaded %d KB image as %s", account.ID(), max(1, len(data)>>10), fileID)
+	basispoints.Logf("%s uploaded %d KB image as %s", tag, max(1, len(data)>>10), fileID)
 	return fileID, nil
 }
 
@@ -396,31 +471,42 @@ func setExcelBPSPromptCacheKey(raw []byte, threadKey string, compact bool) ([]by
 	return json.Marshal(source)
 }
 
-func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []byte, scope, threadKey, proxyURL string, compact, persistReplay bool) (*excelBPSUpstream, error) {
+// tag names the client request in every line logged while it is prepared.
+func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []byte, scope, threadKey, proxyURL string, compact, persistReplay bool, tag string) (*excelBPSUpstream, error) {
 	if account == nil || !account.IsExcelBPSEnabled() {
+		basispoints.Logf("%s is not enabled for Basispoints", tag)
 		return nil, &excelBPSFailure{status: http.StatusBadRequest, code: "disabled"}
 	}
 	token := account.GetAccessToken()
 	if token == "" {
+		basispoints.Logf("%s has no access token", tag)
 		return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "auth_unavailable"}
 	}
 	accountID := excelBPSAccountID(account, token)
 	if accountID == "" {
+		basispoints.Logf("%s has no ChatGPT account ID", tag)
 		return nil, &excelBPSFailure{status: http.StatusBadRequest, code: "account_identity_missing"}
 	}
 	preparedInput, err := setExcelBPSPromptCacheKey(raw, threadKey, compact)
 	if err != nil {
+		basispoints.Logf("%s request rejected before translation: %v", tag, err)
 		return nil, &excelBPSFailure{status: http.StatusBadRequest, code: "request_invalid", detail: err.Error()}
 	}
 	replay := &excelBPSLocalReplay
 	if persistReplay {
 		replay = &excelBPSReplay
 	}
-	prepared, bridge, err := basispoints.Prepare(preparedInput, scope, replay)
+	prepared, bridge, err := basispoints.PrepareWithTag(preparedInput, scope, replay, tag)
 	if err != nil {
-		log.Printf("[excel-bps] account=%d prepare rejected: %v", account.ID(), err)
+		basispoints.Logf("%s prepare rejected: %v", tag, err)
 		return nil, &excelBPSFailure{status: http.StatusBadRequest, code: "request_unsupported", detail: err.Error()}
 	}
+	encrypted := excelBPSEncryptedScope(account, scope)
+	if stripped := stripRememberedEncryptedContent(prepared, rejectedEncryptedContent.get(encrypted)); len(stripped) != len(prepared) {
+		basispoints.Logf("%s left out encrypted reasoning the upstream rejected earlier in this conversation", tag)
+		prepared = stripped
+	}
+	encryptedRetried := false
 	uploaded := make(map[string]bool)
 	upload := func(image basispoints.InlineImage) (string, error) {
 		key := fmt.Sprintf("%d\x00%s", account.ID(), image.Digest)
@@ -431,7 +517,7 @@ func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []b
 		if err != nil {
 			return "", err
 		}
-		fileID, err := uploadExcelBPSImage(ctx, account, proxyURL, token, accountID, mediaType, data, image.Digest)
+		fileID, err := uploadExcelBPSImage(ctx, account, proxyURL, token, accountID, mediaType, data, image.Digest, tag)
 		if err != nil {
 			return "", err
 		}
@@ -439,14 +525,17 @@ func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []b
 		uploaded[fileID] = true
 		return fileID, nil
 	}
-	mode := basispoints.ImagesDefault
+	mode := excelBPSInitialImageMode()
+	// refusedInline is set once BPS refused tool-result images sent inline.
+	refusedInline := false
 	for {
 		body, images, err := basispoints.RewriteImages(prepared, mode, upload)
 		if err != nil {
+			basispoints.Logf("%s request body could not be built (image mode %d): %v", tag, mode, err)
 			return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "request_build_failed"}
 		}
 		if err := images.CurrentUploadErr; err != nil {
-			log.Printf("[excel-bps] account=%d image in the latest turn was not uploaded: %v", account.ID(), err)
+			basispoints.Logf("%s image in the latest turn was not uploaded: %v", tag, err)
 			// Invalid-image messages name only the problem, so they are safe
 			// and useful to return to the client.
 			if errors.Is(err, basispoints.ErrInvalidImage) {
@@ -457,36 +546,70 @@ func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []b
 			return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "image_upload_failed"}
 		}
 		if images.UploadErr != nil {
-			log.Printf("[excel-bps] account=%d history image upload failed, sending a note instead: %v", account.ID(), images.UploadErr)
+			basispoints.Logf("%s history image upload failed, sending a note instead: %v", tag, images.UploadErr)
 		}
 		if images.InputErr != nil {
-			log.Printf("[excel-bps] account=%d history image is invalid, sending a note instead: %v", account.ID(), images.InputErr)
+			basispoints.Logf("%s history image is invalid, sending a note instead: %v", tag, images.InputErr)
 		}
 		request, err := newExcelBPSRequest(ctx, body, token, accountID)
 		if err != nil {
+			basispoints.Logf("%s HTTP request could not be built: %v", tag, err)
 			return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "request_build_failed"}
 		}
 		response, err := excelBPSDo(request, account, proxyURL)
 		if err != nil {
+			// The cause stays in the log: it can name the account proxy.
+			basispoints.Logf("%s upstream request failed (body_bytes=%d): %v", tag, len(body), err)
 			return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "transport_error"}
 		}
 		if response == nil {
+			basispoints.Logf("%s upstream returned no response", tag)
 			return nil, &excelBPSFailure{status: http.StatusBadGateway, code: "empty_response"}
 		}
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-			return &excelBPSUpstream{response: response, bridge: bridge, model: gjson.GetBytes(preparedInput, "model").String()}, nil
+			if refusedInline && mode == basispoints.ImagesUploadAll {
+				excelBPSToolImagesRefusedAt.Store(time.Now().UnixNano())
+			}
+			return &excelBPSUpstream{
+				response: response, bridge: bridge, model: gjson.GetBytes(preparedInput, "model").String(),
+				encrypted: encrypted, digests: encryptedPayloadDigests(body),
+			}, nil
 		}
 		// The body stays out of the client response; operators still need the
 		// provider reason to tell unsupported input from account problems.
-		snippet, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		snippet, _ := io.ReadAll(io.LimitReader(response.Body, upstreamErrorLogBodyMaxBytes))
 		_ = response.Body.Close()
-		log.Printf("[excel-bps] account=%d upstream HTTP %d: %s", account.ID(), response.StatusCode, excelBPSErrorShape(snippet))
-		if !excelBPSImageRefusal(response.StatusCode, snippet) || !images.Any() || mode == basispoints.ImagesOmit {
-			return nil, &excelBPSHTTPError{status: response.StatusCode, code: gjson.GetBytes(snippet, "error.code").String()}
+		basispoints.Logf("%s upstream HTTP %d: %s", tag, response.StatusCode, excelBPSErrorShape(snippet))
+		endpoint := "/v1/responses"
+		if compact {
+			endpoint = "/v1/responses/compact"
 		}
+		logExcelBPSUpstreamError(endpoint, response.StatusCode, gjson.GetBytes(preparedInput, "model").String(), account.ID(), snippet)
+		if response.StatusCode == http.StatusBadRequest && !encryptedRetried && isRejectedEncryptedContentFailure(snippet) {
+			// A conversation that moved between accounts, or from the native
+			// backend, carries reasoning encrypted for another credential.
+			// Without it the history still reads the same.
+			if digests := encryptedPayloadDigests(body); len(digests) > 0 {
+				rejectedEncryptedContent.mark(encrypted, digests)
+				rejected := make(map[encryptedDigest]struct{}, len(digests))
+				for _, digest := range digests {
+					rejected[digest] = struct{}{}
+				}
+				prepared = stripRememberedEncryptedContent(prepared, rejected)
+				encryptedRetried = true
+				basispoints.Logf("%s upstream could not read %d encrypted reasoning item(s); retrying without them", tag, len(digests))
+				continue
+			}
+		}
+		if !excelBPSImageRefusal(response.StatusCode, snippet) || !images.Any() || mode == basispoints.ImagesOmit {
+			failure := &excelBPSHTTPError{status: response.StatusCode, code: gjson.GetBytes(snippet, "error.code").String()}
+			failure.rateLimit, failure.retryAfter = basispoints.RateLimitNotice(snippet, response.Header, response.StatusCode)
+			return nil, failure
+		}
+		refusedInline = refusedInline || images.Inline
 		next, stale := nextExcelBPSImageMode(images, uploaded)
 		excelBPSAttachments.forget(stale)
-		log.Printf("[excel-bps] account=%d upstream refused images (inline=%t file_ids=%d stale=%d); retrying with image mode %d", account.ID(), images.Inline, len(images.FileIDs), len(stale), next)
+		basispoints.Logf("%s upstream refused images (inline=%t file_ids=%d stale=%d); retrying with image mode %d", tag, images.Inline, len(images.FileIDs), len(stale), next)
 		mode = next
 	}
 }
@@ -496,7 +619,7 @@ func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []b
 // stream and bridge; credentials and wire construction remain private.
 func ExecuteExcelBPSRequest(ctx context.Context, account *auth.Account, raw []byte, scope, threadKey, proxyURL string, compact bool) (*ExcelBPSResponse, error) {
 	// Account tests use synthetic threads; their replay stays in memory.
-	upstream, err := prepareExcelBPSUpstream(ctx, account, raw, scope, threadKey, proxyURL, compact, false)
+	upstream, err := prepareExcelBPSUpstream(ctx, account, raw, scope, threadKey, proxyURL, compact, false, newExcelBPSLogTag(account))
 	if err != nil {
 		return nil, err
 	}
@@ -521,6 +644,15 @@ type excelBPSResult struct {
 	// Synthesized marks a completion rebuilt after the upstream closed early;
 	// it has no usage, so its token counts are unknown rather than zero.
 	Synthesized bool
+	// Failure is the provider's unsuccessful terminal event, if any.
+	Failure basispoints.TerminalFailure
+	// TranslationFailure is why the bridge failed a response it could not
+	// translate, or "" when the terminal event came from the provider.
+	TranslationFailure string
+	// LogTag names the account and request in operator logs.
+	LogTag string
+	// RateLimitWaited is how long the request waited out rate limits.
+	RateLimitWaited time.Duration
 }
 
 func (r *excelBPSResult) usageFrom(payload []byte) {
@@ -563,33 +695,420 @@ func writeExcelBPSFrame(w io.Writer, event string, data []byte) error {
 // forwardExcelBPS writes exactly one terminal outcome. BPS is always requested
 // upstream as SSE, while non-stream Responses callers receive the completed
 // response object after the terminal event is validated.
+//
+// Rate limits that arrive before any output are waited out and retried on the
+// same account. Basispoints shares one tokens-per-minute budget per model among
+// everyone using the Excel add-in, so rotating or freezing the account would
+// not help, and the millisecond waits its hints ask for are gone in under a
+// second of client retries while the budget stays spent for the minute.
+const (
+	// excelBPSRateLimitWaitEnv sets, in seconds, how long one request may wait
+	// out rate limits before its client hears of them; 0 relays them at once.
+	excelBPSRateLimitWaitEnv     = "CODEX_EXCEL_BPS_RATE_LIMIT_WAIT"
+	excelBPSDefaultRateLimitWait = 5 * time.Minute
+	excelBPSMaxRateLimitWait     = 30 * time.Minute
+	// excelBPSRateLimitKeepalive is the longest a waiting stream stays silent.
+	// Codex drops a stream that sends nothing for five minutes, and proxies in
+	// front of the gateway often give up much sooner.
+	excelBPSRateLimitKeepalive = 10 * time.Second
+	// excelBPSHoldWindow bounds how long the opening response.created and
+	// response.in_progress frames are held back while no retry has needed
+	// them: a retry within it stays invisible to the client.
+	excelBPSHoldWindow = 10 * time.Second
+	// excelBPSRateLimitGaveUpCode reports a rate limit this request already
+	// waited out in vain. Codex retries rate_limit_exceeded on its own, and
+	// every retry would wait the whole budget again; invalid_prompt is one it
+	// shows to the user as is instead.
+	excelBPSRateLimitGaveUpCode = "invalid_prompt"
+)
+
+// excelBPSRateLimitBackoff is the least wait before each retry, raised to the
+// provider's hint when that is longer; the last step repeats.
+var excelBPSRateLimitBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
+
+// excelBPSSleep waits between rate-limit retries; tests replace it.
+var excelBPSSleep = func(ctx context.Context, wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// excelBPSNow is the clock for hold and keepalive timing; tests replace it.
+var excelBPSNow = time.Now
+
+// excelBPSRateLimitBudget returns how long one request may wait out rate
+// limits: CODEX_EXCEL_BPS_RATE_LIMIT_WAIT seconds, capped at 30 minutes, or 5
+// minutes when it is unset or invalid.
+func excelBPSRateLimitBudget() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(excelBPSRateLimitWaitEnv))
+	if raw == "" {
+		return excelBPSDefaultRateLimitWait
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(seconds) || seconds < 0 {
+		return excelBPSDefaultRateLimitWait
+	}
+	if seconds >= excelBPSMaxRateLimitWait.Seconds() {
+		return excelBPSMaxRateLimitWait
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// excelBPSRateLimitWait returns the wait before rate-limit retry attempt
+// (0-based) after a limit whose provider hint was hint, or false when the
+// budget left cannot cover the hint.
+func excelBPSRateLimitWait(hint time.Duration, attempt int, left time.Duration) (time.Duration, bool) {
+	if left <= 0 || hint > left {
+		return 0, false
+	}
+	step := excelBPSRateLimitBackoff[min(attempt, len(excelBPSRateLimitBackoff)-1)]
+	return min(max(hint, step), left), true
+}
+
+// excelBPSGaveUpMessage is the client notice of a rate limit that outlasted
+// the wait. It names no provider detail.
+func excelBPSGaveUpMessage(waited time.Duration) string {
+	return fmt.Sprintf("%s This request waited %s for the shared Basispoints rate limit to clear and was still limited; send it again later.",
+		basispoints.RateLimitMessage, waited.Round(time.Second))
+}
+
+// excelBPSGaveUpFrame rewrites a sanitized rate-limit terminal frame so the
+// client shows it rather than retrying: the request already waited.
+func excelBPSGaveUpFrame(data []byte, waited time.Duration) []byte {
+	path := "error"
+	if gjson.GetBytes(data, "response.error").Exists() {
+		path = "response.error"
+	}
+	out, err := sjson.SetBytes(data, path+".code", excelBPSRateLimitGaveUpCode)
+	if err == nil {
+		out, err = sjson.SetBytes(out, path+".message", excelBPSGaveUpMessage(waited))
+	}
+	if err != nil {
+		return data
+	}
+	return out
+}
+
+// excelBPSRetry is what forwardExcelBPS does after one attempt.
+type excelBPSRetry int
+
+const (
+	excelBPSDone excelBPSRetry = iota
+	// excelBPSRetryRateLimit waits out a rate limit, then sends the request again.
+	excelBPSRetryRateLimit
+	// excelBPSRetryEncrypted sends the request again at once, without the
+	// encrypted reasoning the upstream could not read.
+	excelBPSRetryEncrypted
+)
+
+// excelBPSAttemptPlan is what one attempt may still retry.
+type excelBPSAttemptPlan struct {
+	// attempt counts the rate-limit retries so far.
+	attempt int
+	// waited is the time spent waiting out rate limits so far, and left what
+	// remains of the budget.
+	waited, left time.Duration
+	// encryptedRetry is set while no attempt has left out rejected reasoning.
+	encryptedRetry bool
+}
+
+// rateLimitRetry returns the wait before retrying a rate limit that arrived
+// before any output, or false when it goes to the client, logging why.
+func (p excelBPSAttemptPlan) rateLimitRetry(tag string, hint time.Duration) (time.Duration, bool) {
+	wait, ok := excelBPSRateLimitWait(hint, p.attempt, p.left)
+	switch {
+	case ok:
+	case p.left <= 0 && p.waited > 0:
+		basispoints.Logf("%s still rate limited after waiting %s; returning it to the client", tag, p.waited)
+	case p.left <= 0:
+		basispoints.Logf("%s rate limited; waiting is disabled, returning it to the client", tag)
+	default:
+		basispoints.Logf("%s rate limited; provider wait %s exceeds the %s left to wait, returning it to the client", tag, hint, p.left)
+	}
+	return wait, ok
+}
+
+// gaveUp reports whether a rate limit reaching the client was already waited on.
+func (p excelBPSAttemptPlan) gaveUp() bool {
+	return p.waited > 0
+}
+
 func forwardExcelBPS(ctx context.Context, c *gin.Context, account *auth.Account, raw []byte, scope, threadKey, proxyURL string, compact, stream, persistReplay bool) (excelBPSResult, error) {
 	start := time.Now()
-	result := excelBPSResult{}
-	upstream, err := prepareExcelBPSUpstream(ctx, account, raw, scope, threadKey, proxyURL, compact, persistReplay)
-	if err != nil {
-		return result, err
+	tag := newExcelBPSLogTag(account)
+	client := newExcelBPSClient(c, stream, gjson.GetBytes(raw, "model").String())
+	budget := excelBPSRateLimitBudget()
+	plan := excelBPSAttemptPlan{left: budget, encryptedRetry: true}
+	for {
+		result, wait, next, err := forwardExcelBPSAttempt(ctx, c, client, account, raw, scope, threadKey, proxyURL, compact, stream, persistReplay, start, plan, tag)
+		result.LogTag = tag
+		result.RateLimitWaited = plan.waited
+		switch next {
+		case excelBPSRetryEncrypted:
+			basispoints.Logf("%s upstream could not read the conversation's encrypted reasoning; retrying without it", tag)
+			plan.encryptedRetry = false
+			continue
+		case excelBPSRetryRateLimit:
+		default:
+			return result, err
+		}
+		basispoints.Logf("%s rate limited before any output; retrying in %s (retry %d, waited %s of %s)", tag, wait, plan.attempt+1, plan.waited, budget)
+		if err := client.wait(ctx, wait); err != nil {
+			basispoints.Logf("%s client went away during the rate-limit wait: %v", tag, err)
+			result.ClientDisconnect = true
+			return result, err
+		}
+		plan.attempt++
+		plan.waited += wait
+		plan.left -= wait
 	}
+}
+
+// newExcelBPSLogTag names one client request in operator logs. The random
+// part ties the bridge's detail lines to the request summary across retries.
+func newExcelBPSLogTag(account *auth.Account) string {
+	var id [4]byte
+	_, _ = rand.Read(id[:])
+	return fmt.Sprintf("account=%d req=%s", excelBPSLogAccountID(account), hex.EncodeToString(id[:]))
+}
+
+func excelBPSLogAccountID(account *auth.Account) int64 {
+	if account == nil {
+		return 0
+	}
+	return account.ID()
+}
+
+// excelBPSFrame is one SSE frame held for the client.
+type excelBPSFrame struct {
+	event string
+	data  []byte
+}
+
+// excelBPSClient writes one client response across the attempts of a request.
+// Until the client has its response.created, opening frames are held so that a
+// retried attempt can replace them unseen. Once it has one, a later attempt's
+// response.created is dropped, so the client sees a single response, and its
+// sequence numbers continue from where the client is.
+type excelBPSClient struct {
+	c       *gin.Context
+	flusher http.Flusher
+	stream  bool
+	model   string
+	start   time.Time
+	// lastWrite is when the client last got a frame, zero before the first.
+	lastWrite time.Time
+	opened    bool
+	held      []excelBPSFrame
+	// response is the latest response object seen in an opening frame; the
+	// keepalive frames repeat it.
+	response json.RawMessage
+	// sequence is the next sequence_number the client has not seen.
+	sequence int64
+	err      error
+}
+
+func newExcelBPSClient(c *gin.Context, stream bool, model string) *excelBPSClient {
+	flusher, _ := c.Writer.(http.Flusher)
+	return &excelBPSClient{c: c, flusher: flusher, stream: stream, model: model, start: excelBPSNow()}
+}
+
+func (w *excelBPSClient) idleSince() time.Time {
+	if w.lastWrite.IsZero() {
+		return w.start
+	}
+	return w.lastWrite
+}
+
+// beginAttempt starts a new upstream attempt. Opening frames of an earlier
+// attempt the client never saw are dropped; the new attempt sends its own.
+func (w *excelBPSClient) beginAttempt(bridge *basispoints.Bridge) {
+	if !w.opened {
+		w.held = nil
+	}
+	bridge.StartSequenceAt(int(w.sequence))
+}
+
+// opening handles a response.created or response.in_progress frame that comes
+// before any output. It returns false once the client is gone.
+func (w *excelBPSClient) opening(event string, data []byte) bool {
+	if response := gjson.GetBytes(data, "response"); response.IsObject() {
+		w.response = json.RawMessage(response.Raw)
+	}
+	if w.opened {
+		if gjson.GetBytes(data, "type").String() == "response.created" {
+			return true
+		}
+		return w.send(event, data)
+	}
+	w.held = append(w.held, excelBPSFrame{event: event, data: append([]byte(nil), data...)})
+	if excelBPSNow().Sub(w.idleSince()) >= excelBPSHoldWindow {
+		return w.open()
+	}
+	return true
+}
+
+// write sends one frame after any held opening frames. It returns false once
+// the client is gone.
+func (w *excelBPSClient) write(event string, data []byte) bool {
+	return w.open() && w.send(event, data)
+}
+
+// open gives the client its response.created: the held opening frames, or a
+// frame made here when no upstream attempt has opened a response yet.
+func (w *excelBPSClient) open() bool {
+	if w.opened {
+		return w.err == nil
+	}
+	w.opened = true
+	held := w.held
+	w.held = nil
+	if len(held) == 0 {
+		held = []excelBPSFrame{{event: "response.created", data: w.frame("response.created")}}
+	}
+	for _, frame := range held {
+		if !w.send(frame.event, frame.data) {
+			return false
+		}
+	}
+	return true
+}
+
+// keepalive tells a waiting client the response is still in progress.
+func (w *excelBPSClient) keepalive() bool {
+	if !w.opened {
+		return w.open()
+	}
+	return w.send("response.in_progress", w.frame("response.in_progress"))
+}
+
+// frame builds an opening or keepalive frame around the latest response
+// object, or around a new one when the upstream has not sent any.
+func (w *excelBPSClient) frame(kind string) []byte {
+	if w.response == nil {
+		var id [12]byte
+		_, _ = rand.Read(id[:])
+		w.response, _ = json.Marshal(map[string]any{
+			"id": "resp_" + hex.EncodeToString(id[:]), "object": "response", "created_at": time.Now().Unix(),
+			"status": "in_progress", "model": w.model, "output": []any{},
+		})
+	}
+	data, _ := json.Marshal(map[string]any{"type": kind, "sequence_number": w.sequence, "response": w.response})
+	return data
+}
+
+func (w *excelBPSClient) send(event string, data []byte) bool {
+	if w.err != nil {
+		return false
+	}
+	// SSE headers wait for the first frame: while frames are held, a failure
+	// is still answered as JSON, which must not carry an SSE content type.
+	if !w.c.Writer.Written() {
+		w.c.Header("Content-Type", "text/event-stream")
+		w.c.Header("Cache-Control", "no-cache")
+		w.c.Header("X-Accel-Buffering", "no")
+	}
+	if w.err = writeExcelBPSFrame(w.c.Writer, event, data); w.err != nil {
+		return false
+	}
+	if w.flusher != nil {
+		w.flusher.Flush()
+	}
+	w.lastWrite = excelBPSNow()
+	if sequence := gjson.GetBytes(data, "sequence_number"); sequence.Exists() && sequence.Int() >= w.sequence {
+		w.sequence = sequence.Int() + 1
+	}
+	return true
+}
+
+// wait sleeps for d. A streaming client gets a keepalive whenever it would
+// otherwise stay silent for excelBPSRateLimitKeepalive, opening its response
+// first if needed, so neither it nor a proxy in front times out.
+func (w *excelBPSClient) wait(ctx context.Context, d time.Duration) error {
+	for d > 0 {
+		step := d
+		if w.stream {
+			due := excelBPSRateLimitKeepalive - excelBPSNow().Sub(w.idleSince())
+			if due <= 0 {
+				if !w.keepalive() {
+					return w.err
+				}
+				due = excelBPSRateLimitKeepalive
+			}
+			step = min(step, due)
+		}
+		if err := excelBPSSleep(ctx, step); err != nil {
+			return err
+		}
+		d -= step
+	}
+	return nil
+}
+
+// forwardExcelBPSAttempt sends the request once. It returns a retry instead of
+// relaying a rate limit that the plan can still wait out, or an upstream
+// refusal of the conversation's encrypted reasoning, when either arrives
+// before any output.
+func forwardExcelBPSAttempt(ctx context.Context, c *gin.Context, client *excelBPSClient, account *auth.Account, raw []byte, scope, threadKey, proxyURL string, compact, stream, persistReplay bool, start time.Time, plan excelBPSAttemptPlan, tag string) (excelBPSResult, time.Duration, excelBPSRetry, error) {
+	result := excelBPSResult{}
+	upstream, err := prepareExcelBPSUpstream(ctx, account, raw, scope, threadKey, proxyURL, compact, persistReplay, tag)
+	if err != nil {
+		var limited *excelBPSHTTPError
+		if errors.As(err, &limited) && limited.rateLimit != "" {
+			if wait, ok := plan.rateLimitRetry(tag, limited.retryAfter); ok {
+				return result, wait, excelBPSRetryRateLimit, err
+			}
+			if plan.gaveUp() {
+				limited.rateLimit, limited.gaveUp = excelBPSGaveUpMessage(plan.waited), true
+			}
+		}
+		return result, 0, excelBPSDone, err
+	}
+	client.beginAttempt(upstream.bridge)
 	defer upstream.response.Body.Close()
 	result.StatusCode = upstream.response.StatusCode
 	result.Model = upstream.model
 	result.RequestID = upstream.response.Header.Get("x-request-id")
 	converted := upstream.bridge.Stream(upstream.response.Body)
 	defer converted.Close()
-	if stream {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("X-Accel-Buffering", "no")
-	}
-	flusher, _ := c.Writer.(http.Flusher)
 	var completed []byte
-	var writeErr error
+	outputStarted := false
+	gaveUp := false
+	next, retryWait := excelBPSDone, time.Duration(0)
 	terminalSeen := false
 	readErr := ReadSSEStreamWithEvent(converted, func(event string, data []byte) bool {
 		if terminalSeen {
 			return false
 		}
 		kind := gjson.GetBytes(data, "type").String()
+		if !outputStarted && (kind == "response.created" || kind == "response.in_progress") {
+			if stream && !client.opening(event, data) {
+				result.ClientDisconnect = true
+				return false
+			}
+			return true
+		}
+		if !outputStarted && excelBPSTerminal(kind) {
+			failure := upstream.bridge.UpstreamFailure()
+			if failure.RateLimit != "" {
+				if wait, ok := plan.rateLimitRetry(tag, failure.RetryAfter); ok {
+					next, retryWait = excelBPSRetryRateLimit, wait
+					return false
+				}
+				if plan.gaveUp() {
+					data, gaveUp = excelBPSGaveUpFrame(data, plan.waited), true
+				}
+			} else if plan.encryptedRetry && len(failure.Raw) > 0 && isRejectedEncryptedContentFailure(responseFailedErrorBody(failure.Raw)) && upstream.rejectEncrypted() {
+				next = excelBPSRetryEncrypted
+				return false
+			}
+		}
+		outputStarted = true
 		if result.FirstTokenMs == 0 && (kind == "response.output_text.delta" || kind == "response.output_item.added") {
 			result.FirstTokenMs = int(time.Since(start).Milliseconds())
 		}
@@ -608,52 +1127,79 @@ func forwardExcelBPS(ctx context.Context, c *gin.Context, account *auth.Account,
 				return false
 			}
 		}
-		if stream {
-			writeErr = writeExcelBPSFrame(c.Writer, event, data)
-			if writeErr == nil && flusher != nil {
-				flusher.Flush()
-			}
-			if writeErr != nil {
-				result.ClientDisconnect = true
-				return false
-			}
+		if stream && !client.write(event, data) {
+			result.ClientDisconnect = true
+			return false
 		}
 		return !terminalSeen
 	})
+	if next != excelBPSDone {
+		return result, retryWait, next, nil
+	}
 	result.DurationMs = int(time.Since(start).Milliseconds())
 	result.Synthesized = upstream.bridge.SynthesizedCompletion()
-	if writeErr != nil {
-		return result, writeErr
+	result.Failure = upstream.bridge.UpstreamFailure()
+	result.TranslationFailure = upstream.bridge.TranslationFailure()
+	if client.err != nil {
+		return result, 0, excelBPSDone, client.err
 	}
 	if ctx.Err() != nil {
 		result.ClientDisconnect = true
-		return result, ctx.Err()
+		return result, 0, excelBPSDone, ctx.Err()
 	}
 	if readErr != nil {
-		return result, readErr
+		return result, 0, excelBPSDone, readErr
 	}
 	if !terminalSeen {
-		return result, errors.New("Basispoints stream ended before a terminal event")
+		return result, 0, excelBPSDone, errors.New("Basispoints stream ended before a terminal event")
 	}
 	if !stream {
 		if result.Terminal != "response.completed" {
-			return result, errors.New("Basispoints response did not complete")
+			if notice := result.Failure.RateLimit; notice != "" {
+				if gaveUp {
+					notice = excelBPSGaveUpMessage(plan.waited)
+				}
+				return result, 0, excelBPSDone, &excelBPSFailure{status: http.StatusTooManyRequests, code: "rate_limited", detail: notice}
+			}
+			if code := result.Failure.ClientCode; code != "" {
+				return result, 0, excelBPSDone, &excelBPSHTTPError{status: http.StatusBadRequest, code: code}
+			}
+			return result, 0, excelBPSDone, errors.New("Basispoints response did not complete")
 		}
 		response := gjson.GetBytes(completed, "response")
 		if !response.Exists() {
-			return result, errors.New("Basispoints response did not contain a completed response")
+			return result, 0, excelBPSDone, errors.New("Basispoints response did not contain a completed response")
 		}
 		c.Data(http.StatusOK, "application/json", []byte(response.Raw))
 	}
-	return result, nil
+	return result, 0, excelBPSDone, nil
+}
+
+// logExcelBPSUpstreamError writes a Basispoints upstream failure to the error
+// log files. Unlike logUpstreamError it also keeps 401/403/429: the client
+// only gets a sanitized message, so the file is where operators read the cause.
+func logExcelBPSUpstreamError(endpoint string, status int, model string, accountID int64, body []byte) {
+	if status >= http.StatusInternalServerError {
+		serverErrorLogger.writeEntry(endpoint, status, model, accountID, body)
+		return
+	}
+	badRequestLogger.writeEntry(endpoint, status, model, accountID, body)
 }
 
 func excelBPSFailureInfo(err error) (int, string, string) {
 	var upstream *excelBPSHTTPError
 	if errors.As(err, &upstream) {
 		status := upstream.status
+		if upstream.rateLimit != "" {
+			return status, "rate_limit_exceeded", upstream.rateLimit
+		}
 		if status >= http.StatusInternalServerError {
 			status = http.StatusBadGateway
+		}
+		if message, ok := basispoints.ClientError(upstream.code); ok && status < http.StatusInternalServerError {
+			// Codex acts on these codes (it compacts a full context window), so
+			// the code goes through; the provider message never does.
+			return status, upstream.code, message
 		}
 		return status, "basispoints_upstream_error", "Basispoints upstream rejected the request"
 	}
@@ -670,6 +1216,8 @@ func excelBPSFailureInfo(err error) (int, string, string) {
 				message += ": " + failure.detail
 			}
 			return status, "basispoints_request_invalid", message
+		case "rate_limited":
+			return status, "rate_limit_exceeded", failure.detail
 		case "image_upload_failed":
 			return status, "basispoints_image_upload_failed", "Basispoints could not upload an image from the latest turn; retry the request"
 		case "account_identity_missing":
@@ -756,10 +1304,14 @@ func excelBPSNativeFailureReason(err error) string {
 	return ""
 }
 
-func markExcelBPSNativeFallback(c *gin.Context, account *auth.Account, reason string) {
+// tag is the request's log tag, or "" when the request never reached BPS.
+func markExcelBPSNativeFallback(c *gin.Context, account *auth.Account, reason, tag string) {
 	c.Set(excelBPSNativeFallbackKey, reason)
 	c.Header("X-Codex2api-Upstream-Fallback", "basispoints-to-codex")
-	log.Printf("[excel-bps] account=%d native fallback reason=%s before_output=true", account.ID(), reason)
+	if tag == "" {
+		tag = fmt.Sprintf("account=%d", account.ID())
+	}
+	basispoints.Logf("%s native fallback reason=%s before_output=true", tag, reason)
 }
 
 // handleExcelBPS returns false when the normal Codex handler must continue with
@@ -774,7 +1326,7 @@ func (h *Handler) handleExcelBPS(c *gin.Context, account *auth.Account, raw []by
 	}
 	if c.Request.Context().Err() == nil && !c.Writer.Written() {
 		if reason := excelBPSNativeRequestReason(raw); reason != "" {
-			markExcelBPSNativeFallback(c, account, reason)
+			markExcelBPSNativeFallback(c, account, reason, "")
 			return false
 		}
 	}
@@ -802,7 +1354,7 @@ func (h *Handler) handleExcelBPS(c *gin.Context, account *auth.Account, raw []by
 		logInput.UpstreamErrorKind = code
 		logInput.ErrorMessage = message
 		if reason := excelBPSNativeFailureReason(err); reason != "" && !result.ClientDisconnect && c.Request.Context().Err() == nil && !c.Writer.Written() {
-			markExcelBPSNativeFallback(c, account, reason)
+			markExcelBPSNativeFallback(c, account, reason, result.LogTag)
 			logInput.IsRetryAttempt = true
 			if h != nil {
 				h.logUsageForRequest(c, logInput)
@@ -810,16 +1362,44 @@ func (h *Handler) handleExcelBPS(c *gin.Context, account *auth.Account, raw []by
 			return false
 		}
 		if !result.ClientDisconnect {
-			writeExcelBPSFailure(c, stream, status, code, message)
+			clientCode := code
+			var limited *excelBPSHTTPError
+			if stream && c.Writer.Written() && errors.As(err, &limited) && limited.gaveUp {
+				// The stream is already open, so the client reads the code.
+				clientCode = excelBPSRateLimitGaveUpCode
+			}
+			writeExcelBPSFailure(c, stream, status, clientCode, message)
 		}
 	}
 	if result.Synthesized && logInput.UpstreamErrorKind == "" {
 		// Status stays 200; the kind makes the missing usage visible in logs.
 		logInput.UpstreamErrorKind = "basispoints_cutoff_completed"
 	}
+	if reason := result.TranslationFailure; reason != "" {
+		// The bridge failed the response itself; the provider's own terminal
+		// event, if any, was never relayed, so name the translation cause.
+		logInput.UpstreamErrorKind = "basispoints_protocol_error"
+		logInput.ErrorMessage = "Basispoints response could not be translated: " + reason
+	}
 	if result.Terminal != "response.completed" && result.Terminal != "" && logInput.ErrorMessage == "" {
 		logInput.UpstreamErrorKind = "basispoints_terminal_" + strings.TrimPrefix(result.Terminal, "response.")
 		logInput.ErrorMessage = "Basispoints returned a non-completed terminal event"
+	}
+	if failure := result.Failure; len(failure.Raw) > 0 {
+		if logInput.ErrorMessage != "" {
+			logInput.ErrorMessage += " (upstream " + failure.Shape + ")"
+		}
+		outcome := classifyResponseFailedOutcome(failure.Raw)
+		logExcelBPSUpstreamError(endpoint, outcome.logStatusCode, logModel, account.ID(), responseFailedErrorBody(failure.Raw))
+	}
+	if err != nil || result.Terminal != "response.completed" || result.Synthesized {
+		tag := result.LogTag
+		if tag == "" {
+			tag = fmt.Sprintf("account=%d", account.ID())
+		}
+		basispoints.Logf("%s %s ended unsuccessfully: model=%s stream=%t compact=%t terminal=%q kind=%q message=%q status=%d upstream_status=%d request_id=%q client_disconnect=%t rate_limit_waited=%s duration=%dms err=%v",
+			tag, endpoint, logModel, stream, compact, result.Terminal, logInput.UpstreamErrorKind, logInput.ErrorMessage,
+			logInput.StatusCode, result.StatusCode, result.RequestID, result.ClientDisconnect, result.RateLimitWaited, result.DurationMs, err)
 	}
 	if h != nil {
 		h.logUsageForRequest(c, logInput)

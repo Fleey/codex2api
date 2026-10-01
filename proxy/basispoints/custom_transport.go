@@ -74,7 +74,7 @@ func (b *Bridge) rawFieldEnvelope(arguments object) (object, bool, error) {
 	// Recover an omitted field only when the exact declared tool makes the
 	// interpretation unique. Never guess a tool, field or optional argument.
 	if cut < 0 && validTransportToken(spec) {
-		if info, exists := b.tools[spec]; exists {
+		if info, exists := b.lookupTool(spec); exists {
 			if info.Kind == "custom" {
 				return customTransportEnvelope(object{"summary": customTransportPrefix + spec, "code": arguments["code"]})
 			}
@@ -88,12 +88,24 @@ func (b *Bridge) rawFieldEnvelope(arguments object) (object, bool, error) {
 		return nil, true, fmt.Errorf("basispoints raw field transport requires summary codex2api.raw/CATALOG_NAME/FIELD")
 	}
 	name, field := spec[:cut], spec[cut+1:]
-	info, ok := b.tools[name]
+	info, ok := b.lookupTool(name)
 	if !ok {
-		return nil, true, fmt.Errorf("basispoints returned a tool outside the client's catalog")
+		return nil, true, outsideCatalogError(name)
 	}
-	if info.RawField == "" || info.RawField != field {
-		return nil, true, fmt.Errorf("basispoints raw field transport does not accept that field for this tool")
+	if info.Kind == "custom" {
+		// A custom tool takes one raw text input, so whichever field the
+		// model named, code can only be that input.
+		return customTransportEnvelope(object{"summary": customTransportPrefix + name, "code": arguments["code"]})
+	}
+	if info.RawField == "" {
+		return nil, true, fmt.Errorf("basispoints raw field transport named field %q, but tool %q has no raw field; put one JSON client-tool envelope with its arguments in code",
+			truncateRunes(field, 64), truncateRunes(info.key(), 64))
+	}
+	if info.RawField != field {
+		// Never move the value to another field: an optional field would
+		// silently lose the required one.
+		return nil, true, fmt.Errorf("basispoints raw field transport named field %q, but tool %q takes only %q; use summary %q",
+			truncateRunes(field, 64), truncateRunes(info.key(), 64), info.RawField, rawFieldTransportPrefix+info.key()+"/"+info.RawField)
 	}
 	value, ok := arguments["code"].(string)
 	if !ok {

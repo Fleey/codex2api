@@ -1,12 +1,20 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
@@ -173,6 +181,39 @@ func TestExcelBPSFailureInfoExplainsRejectedRequest(t *testing.T) {
 	}
 	if !strings.Contains(message, "requires expanded history instead of previous_response_id") {
 		t.Fatalf("message does not explain the rejection: %q", message)
+	}
+}
+
+func TestExcelBPSRelaysContextWindowCodeCodexCompactsOn(t *testing.T) {
+	t.Setenv("LOG_DISABLED", "true")
+	gin.SetMode(gin.TestMode)
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	overflow := `{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input of 921375 tokens about project-x exceeds"}}`
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"HTTP 400", http.StatusBadRequest, overflow},
+		{"stream response.failed", http.StatusOK, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+			"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"status\":\"failed\"," + overflow[1:len(overflow)-1] + "}}\n\n"},
+	}
+	for _, tc := range cases {
+		excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+			return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+		}
+		for _, stream := range []bool{true, false} {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			raw := fmt.Sprintf(`{"model":"gpt-5.5","input":"hello","stream":%t}`, stream)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+			(&Handler{}).handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, stream, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "medium", "", auth.SessionAffinityGuard{}, time.Now())
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"code":"context_length_exceeded"`) || strings.Contains(body, "project-x") || strings.Contains(body, "event: error") {
+				t.Fatalf("%s stream=%t: context window code not relayed safely: %s", tc.name, stream, body)
+			}
+		}
 	}
 }
 
@@ -381,5 +422,285 @@ func TestExcelBPSReplayPersistsOnlyForSessionScopedConversations(t *testing.T) {
 	}
 	if excelBPSConversationScoped(headers, requestSessionIdentity{hasDownstreamAffinity: true}) {
 		t.Fatal("an affinity header replaced the scope but replay still persisted")
+	}
+}
+
+func TestHandleExcelBPSWritesUpstreamFailuresToErrorLogs(t *testing.T) {
+	stubExcelBPSSleep(t)
+	dir := t.TempDir()
+	t.Setenv("LOG_DIR", dir)
+	t.Setenv("LOG_DISABLED", "")
+	previousBad, previousServer := badRequestLogger, serverErrorLogger
+	badRequestLogger = &fileLogger{path: "bad_request.log"}
+	serverErrorLogger = &fileLogger{path: "server_error.log"}
+	t.Cleanup(func() {
+		CloseErrorLogger()
+		badRequestLogger, serverErrorLogger = previousBad, previousServer
+	})
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	gin.SetMode(gin.TestMode)
+	run := func(status int, body string) string {
+		excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		raw := `{"model":"gpt-5.5","input":"hello","stream":true}`
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+		var h *Handler
+		h.handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, true, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+		return recorder.Body.String()
+	}
+
+	client := run(http.StatusOK, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"code\":\"server_error\",\"message\":\"stream provider detail\"}}\n\n")
+	if strings.Contains(client, "stream provider detail") {
+		t.Fatalf("provider message reached the client: %s", client)
+	}
+	run(http.StatusTooManyRequests, `{"error":{"code":"rate_limit_exceeded","message":"http provider detail"}}`)
+
+	serverLog, _ := os.ReadFile(filepath.Join(dir, "server_error.log"))
+	if !strings.Contains(string(serverLog), "stream provider detail") || !strings.Contains(string(serverLog), "Status: 500") {
+		t.Fatalf("server_error.log missing the stream failure: %s", serverLog)
+	}
+	badLog, _ := os.ReadFile(filepath.Join(dir, "bad_request.log"))
+	if !strings.Contains(string(badLog), "http provider detail") || !strings.Contains(string(badLog), "Status: 429") {
+		t.Fatalf("bad_request.log missing the HTTP 429 failure: %s", badLog)
+	}
+}
+
+func TestHandleExcelBPSReturnsRateLimitWithRetryDelayOnly(t *testing.T) {
+	stubExcelBPSSleep(t)
+	t.Setenv("LOG_DISABLED", "true")
+	// No waiting: the limit goes to the client as the provider gave it.
+	t.Setenv(excelBPSRateLimitWaitEnv, "0")
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	gin.SetMode(gin.TestMode)
+	run := func(stream bool, status int, header http.Header, body string) *httptest.ResponseRecorder {
+		excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: header}, nil
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		raw := fmt.Sprintf(`{"model":"gpt-5.5","input":"hello","stream":%t}`, stream)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+		var h *Handler
+		h.handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, stream, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+		return recorder
+	}
+	check := func(name string, recorder *httptest.ResponseRecorder, want string) {
+		t.Helper()
+		body := recorder.Body.String()
+		if recorder.Code != http.StatusTooManyRequests || !strings.Contains(body, `"code":"rate_limit_exceeded"`) || !strings.Contains(body, want) {
+			t.Fatalf("%s: status=%d body=%s", name, recorder.Code, body)
+		}
+		if strings.Contains(body, "org-synthetic") || strings.Contains(body, "Used 40000000") {
+			t.Fatalf("%s: provider detail reached the client: %s", name, body)
+		}
+	}
+
+	header := http.Header{}
+	header.Set("Retry-After", "3")
+	check("HTTP 429", run(true, http.StatusTooManyRequests, header, `{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached in organization org-synthetic: Used 40000000"}}`), "Please try again in 3s.")
+
+	event := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\",\"headers\":{\"retry-after-ms\":\"74\"},\"message\":\"Rate limit reached in organization org-synthetic: Used 40000000\"}}\n\n"
+	check("non-stream error event", run(false, http.StatusOK, make(http.Header), event), "Please try again in 74ms.")
+}
+
+// stubExcelBPSSleep makes rate-limit retries immediate and records the waits.
+func stubExcelBPSSleep(t *testing.T) *[]time.Duration {
+	t.Helper()
+	previous := excelBPSSleep
+	t.Cleanup(func() { excelBPSSleep = previous })
+	var waits []time.Duration
+	excelBPSSleep = func(_ context.Context, wait time.Duration) error {
+		waits = append(waits, wait)
+		return nil
+	}
+	return &waits
+}
+
+func TestForwardExcelBPSRetriesRateLimitBeforeAnyOutput(t *testing.T) {
+	t.Setenv("LOG_DISABLED", "true")
+	gin.SetMode(gin.TestMode)
+	const opening = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+		"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\",\"output\":[]}}\n\n"
+	limited := func(retryAfterMS string) string {
+		return opening + "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\",\"headers\":{\"retry-after-ms\":\"" + retryAfterMS + "\"},\"message\":\"org-synthetic is over its TPM\"}}\n\n"
+	}
+	const answered = opening + "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[]}}\n\n"
+	const limitedAfterOutput = opening + "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\",\"headers\":{\"retry-after-ms\":\"74\"}}}\n\n"
+	type reply struct {
+		status int
+		body   string
+	}
+	cases := []struct {
+		name     string
+		budget   string
+		replies  []reply
+		attempts int
+		waits    []time.Duration
+		terminal string
+		want     []string
+		absent   []string
+	}{
+		{
+			name:     "stream limit then success",
+			replies:  []reply{{http.StatusOK, limited("74")}, {http.StatusOK, answered}},
+			attempts: 2, waits: []time.Duration{time.Second}, terminal: "response.completed",
+			want: []string{"hello"}, absent: []string{"rate_limit", "org-synthetic"},
+		},
+		{
+			name:     "HTTP 429 then success",
+			replies:  []reply{{http.StatusTooManyRequests, `{"error":{"code":"rate_limit_exceeded"}}`}, {http.StatusOK, answered}},
+			attempts: 2, waits: []time.Duration{time.Second}, terminal: "response.completed",
+			want: []string{"hello"}, absent: []string{"rate_limit"},
+		},
+		{
+			name:     "provider hint above the backoff",
+			replies:  []reply{{http.StatusOK, limited("5000")}, {http.StatusOK, answered}},
+			attempts: 2, waits: []time.Duration{5 * time.Second}, terminal: "response.completed",
+			want: []string{"hello"}, absent: []string{"rate_limit"},
+		},
+		{
+			name:     "provider wait above the budget",
+			budget:   "3",
+			replies:  []reply{{http.StatusOK, limited("5000")}},
+			attempts: 1, terminal: "response.failed",
+			want: []string{`"code":"rate_limit_exceeded"`, "Please try again in 5s."}, absent: []string{"org-synthetic"},
+		},
+		{
+			name:     "limit after output",
+			replies:  []reply{{http.StatusOK, limitedAfterOutput}},
+			attempts: 1, terminal: "response.failed",
+			want: []string{"hel", `"code":"rate_limit_exceeded"`},
+		},
+		{
+			// The request already waited, so the client must not retry it.
+			name:     "budget exhausted",
+			budget:   "4",
+			replies:  []reply{{http.StatusOK, limited("74")}},
+			attempts: 4, waits: []time.Duration{time.Second, 2 * time.Second, time.Second}, terminal: "response.failed",
+			want: []string{`"code":"invalid_prompt"`, "waited 4s"}, absent: []string{"org-synthetic", "rate_limit_exceeded"},
+		},
+	}
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	for _, tc := range cases {
+		t.Setenv(excelBPSRateLimitWaitEnv, tc.budget)
+		waits := stubExcelBPSSleep(t)
+		attempts := 0
+		excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+			next := tc.replies[min(attempts, len(tc.replies)-1)]
+			attempts++
+			return &http.Response{StatusCode: next.status, Body: io.NopCloser(strings.NewReader(next.body)), Header: make(http.Header)}, nil
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		raw := `{"model":"gpt-5.5","input":"hello","stream":true}`
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+		result, err := forwardExcelBPS(ctx, ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, true, false)
+		if err != nil {
+			t.Fatalf("%s: forwardExcelBPS: %v", tc.name, err)
+		}
+		body := recorder.Body.String()
+		if attempts != tc.attempts || result.Terminal != tc.terminal || fmt.Sprint(*waits) != fmt.Sprint(tc.waits) {
+			t.Fatalf("%s: attempts=%d terminal=%q waits=%v body=%s", tc.name, attempts, result.Terminal, *waits, body)
+		}
+		if strings.Count(body, `"type":"response.created"`) != 1 {
+			t.Fatalf("%s: client should see exactly one response.created: %s", tc.name, body)
+		}
+		// Codex ignores a bare error event and retries the "unfinished" stream.
+		if strings.Contains(body, "event: error") {
+			t.Fatalf("%s: client got an error event instead of response.failed: %s", tc.name, body)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(body, want) {
+				t.Fatalf("%s: missing %s in %s", tc.name, want, body)
+			}
+		}
+		for _, absent := range tc.absent {
+			if strings.Contains(body, absent) {
+				t.Fatalf("%s: unexpected %s in %s", tc.name, absent, body)
+			}
+		}
+	}
+}
+
+func TestForwardExcelBPSAnswersJSONWhenStreamEndsWhileFramesAreHeld(t *testing.T) {
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+		body := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\",\"output\":[]}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	}
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	raw := `{"model":"gpt-5.5","input":"hello","stream":true}`
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+	var h *Handler
+	h.handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, true, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("Content-Type = %q, body=%s", got, recorder.Body.String())
+	}
+}
+
+func TestHandleExcelBPSLogsFailureSummaryWithRequestTag(t *testing.T) {
+	stubExcelBPSSleep(t)
+	t.Setenv("LOG_DISABLED", "true")
+	var logs bytes.Buffer
+	previousOut, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousOut)
+		log.SetFlags(previousFlags)
+	})
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	gin.SetMode(gin.TestMode)
+	run := func() {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		raw := `{"model":"gpt-5.5","input":"hello","stream":true}`
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+		var h *Handler
+		h.handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/key:1/thread:1", "thread:1", "", false, true, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+	}
+
+	excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+		body := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c\",\"name\":\"excel_native\",\"arguments\":\"{}\"}]}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	}
+	run()
+	summary := regexp.MustCompile(`\[excel-bps\] (account=91 req=[0-9a-f]{8}) /v1/responses ended unsuccessfully: .*terminal="response.failed" kind="basispoints_protocol_error" message="Basispoints response could not be translated: basispoints response contained only tool calls that could not be relayed \(dropped=1 output_items=1\)"`).FindStringSubmatch(logs.String())
+	if summary == nil {
+		t.Fatalf("request summary missing: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), summary[1]+` dropped an untranslatable tool call (type="function_call" name="excel_native" call_id="c")`) {
+		t.Fatalf("bridge detail does not carry the summary's request tag %q: %s", summary[1], logs.String())
+	}
+
+	logs.Reset()
+	excelBPSDo = func(*http.Request, *auth.Account, string) (*http.Response, error) {
+		return nil, errors.New("dial tcp: connection refused")
+	}
+	run()
+	// A transport failure before any output goes to the native path, which
+	// logs why instead of a failure summary.
+	if !regexp.MustCompile(`\[excel-bps\] account=91 req=[0-9a-f]{8} upstream request failed`).MatchString(logs.String()) {
+		t.Fatalf("transport failure log does not carry the request tag: %s", logs.String())
+	}
+	if !regexp.MustCompile(`account=91 req=[0-9a-f]{8} native fallback reason=transport_error`).MatchString(logs.String()) {
+		t.Fatalf("native fallback log does not carry the request tag: %s", logs.String())
+	}
+	for _, want := range []string{"connection refused"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("transport failure log is missing %q: %s", want, logs.String())
+		}
 	}
 }

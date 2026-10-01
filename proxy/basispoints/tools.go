@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"encoding/json"
 	"fmt"
-	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +21,19 @@ type tool struct {
 	// one-element array (the built-in shell tool's commands).
 	RawField  string
 	RawAsList bool
+	// Description is the client's description, kept for the full definition
+	// of a tool the catalog only summarizes.
+	Description string
+	// Summarized marks a tool the prompt catalog lists in summary form.
+	Summarized bool
+}
+
+// key is the tool's catalog name: its name, qualified by its namespace.
+func (t tool) key() string {
+	if t.Namespace == "" {
+		return t.Name
+	}
+	return t.Namespace + "." + t.Name
 }
 
 type replayEntry struct {
@@ -102,7 +114,7 @@ func (c *ReplayCache) backingFailed(err error) {
 	c.backingDownUntil = time.Now().Add(replayBackingCooldown)
 	c.mu.Unlock()
 	if !alreadyDown {
-		log.Printf("[excel-bps] replay store unavailable, using memory only for %s: %v", replayBackingCooldown, err)
+		Logf("replay store unavailable, using memory only for %s: %v", replayBackingCooldown, err)
 	}
 }
 
@@ -276,6 +288,9 @@ func historyCallFingerprint(item object) string {
 	if isBuiltinCall(item) {
 		return builtinCallFingerprint(item)
 	}
+	if isToolSearchCall(item) {
+		return toolSearchCallFingerprint(item)
+	}
 	kind, id, name := text(item["type"]), text(item["call_id"]), text(item["name"])
 	if id == "" || name == "" || strings.TrimSpace(id) != id || strings.TrimSpace(name) != name {
 		return ""
@@ -375,6 +390,12 @@ func (b *Bridge) collectTools(value any, namespace string) ([]any, error) {
 			}
 			continue
 		}
+		if kind == toolSearchKind && namespace == "" && isClientExecution(item) {
+			if entry, ok := b.registerToolSearch(item); ok {
+				catalog = append(catalog, entry)
+			}
+			continue
+		}
 		if kind != "function" && kind != "custom" {
 			// Server-hosted and unknown tool kinds (web_search, file_search, ...)
 			// cannot be relayed as client calls. Omit them with a model-visible
@@ -415,7 +436,7 @@ func (b *Bridge) collectTools(value any, namespace string) ([]any, error) {
 			continue
 		}
 		parameters, _ := entry["parameters"].(object)
-		info := tool{Name: name, Namespace: namespace, Kind: kind, Definition: definition, Parameters: parameters}
+		info := tool{Name: name, Namespace: namespace, Kind: kind, Definition: definition, Parameters: parameters, Description: text(item["description"])}
 		if kind == "function" {
 			info.RawField = rawFieldFor(parameters)
 			if info.RawField != "" {
@@ -439,9 +460,19 @@ func rebuildNativeHistoryCall(item object) (object, error) {
 		}
 		return transportHistoryCall(item, object{"name": name, "arguments": args})
 	}
+	if isToolSearchCall(item) {
+		args, err := toolSearchArguments(item["arguments"])
+		if err != nil {
+			return nil, err
+		}
+		return transportHistoryCall(item, object{"name": toolSearchKind, "arguments": args})
+	}
 	id, name := text(item["call_id"]), text(item["name"])
 	if id == "" || strings.TrimSpace(id) != id || name == "" || strings.TrimSpace(name) != name {
 		return nil, fmt.Errorf("basispoints history recovery requires a complete tool call with nonempty call_id and name")
+	}
+	if leaked, ok := leakedTransportCall(item); ok {
+		return leaked, nil
 	}
 	if value, exists := item["namespace"]; exists {
 		namespace, ok := value.(string)
@@ -475,6 +506,38 @@ func rebuildNativeHistoryCall(item object) (object, error) {
 		return nil, fmt.Errorf("basispoints history recovery requires a function or custom tool call")
 	}
 	return transportHistoryCall(item, envelope)
+}
+
+// leakedTransportCall replays a run_officejs call that another relay (an
+// older gateway, excel-codex-bridge, a SUB2API node) let through to the client
+// as the BPS-native item it already is. Wrapping it in a second run_officejs
+// would teach the model, which copies its history, to nest envelopes.
+func leakedTransportCall(item object) (object, bool) {
+	name := text(item["name"])
+	if text(item["type"]) != "function_call" || text(item["namespace"]) != "" || (name != "run_officejs" && name != "functions.run_officejs") {
+		return nil, false
+	}
+	arguments, ok := item["arguments"].(string)
+	if !ok {
+		raw, err := json.Marshal(item["arguments"])
+		if err != nil {
+			return nil, false
+		}
+		arguments = string(raw)
+	}
+	var fields object
+	if decode([]byte(arguments), &fields) != nil || fields == nil {
+		return nil, false
+	}
+	id := text(item["call_id"])
+	itemID := text(item["id"])
+	if !strings.HasPrefix(itemID, "fc_") || len(itemID) > 64 {
+		itemID = "fc_" + fingerprint(id)
+	}
+	return object{
+		"type": "function_call", "id": itemID, "call_id": id, "name": "run_officejs",
+		"arguments": arguments, "status": "completed",
+	}, true
 }
 
 // transportHistoryCall wraps a recovered envelope in the run_officejs item BPS
@@ -527,6 +590,9 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 	// callIDs maps a client call item's id to its call_id: the Responses
 	// local_shell_call_output names its call by id rather than call_id.
 	callIDs := make(map[string]string)
+	// definitionNotes holds, by call_id, the full definition of a summarized
+	// tool whose call did not match it, for that call's result.
+	definitionNotes := make(map[string]string)
 	var trigger any
 	for _, raw := range input {
 		item, ok := raw.(object)
@@ -551,10 +617,13 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 				result = append(result, object{"type": "reasoning", "summary": []any{}, "encrypted_content": encrypted})
 			}
 			continue
-		case "function_call", "custom_tool_call", "local_shell_call", "shell_call", "apply_patch_call":
+		case "function_call", "custom_tool_call", "local_shell_call", "shell_call", "apply_patch_call", toolSearchCallType:
 			id := text(item["call_id"])
 			if itemID := text(item["id"]); itemID != "" && id != "" {
 				callIDs[itemID] = id
+			}
+			if note := b.mismatchNote(item); note != "" {
+				definitionNotes[id] = note
 			}
 			if native := b.replay.getForCall(b.scope, id, item); native != nil {
 				item = native
@@ -568,8 +637,14 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 			}
 			seenCalls[id] = true
 			nativePlans[id] = isNativePlan(item)
-		case "function_call_output", "custom_tool_call_output", "local_shell_call_output", "shell_call_output", "apply_patch_call_output":
+		case "function_call_output", "custom_tool_call_output", "local_shell_call_output", "shell_call_output", "apply_patch_call_output",
+			toolSearchOutputType, toolSearchCallOutputType:
 			id := text(item["call_id"])
+			if isToolSearchOutput(item) {
+				// BPS knows only run_officejs results: the loaded tools become
+				// the text result of the run_officejs call that searched.
+				item = object{"type": "function_call_output", "call_id": id, "output": b.toolSearchOutputText(item)}
+			}
 			if _, builtin := builtinKindForCall(text(item["type"])); builtin {
 				if id == "" {
 					// Spec-shaped local_shell_call_output carries only id, which
@@ -599,7 +674,10 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 			} else if output, ok := item["output"].(string); item["output"] == nil || ok && strings.TrimSpace(output) == "" {
 				item["output"] = emptyToolOutput
 			}
-			if err := validateHistoryContent(item["output"]); err != nil {
+			if note := definitionNotes[id]; note != "" {
+				item["output"] = appendOutputNote(item["output"], note)
+			}
+			if err := b.sanitizeHistoryContent(item["output"], ""); err != nil {
 				return nil, err
 			}
 			// Codex custom results carry ctco_ IDs. After lowering to a function
@@ -615,7 +693,7 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 		case "configuration_update":
 			return nil, fmt.Errorf("basispoints does not support configuration_update; start a new request with the desired effort")
 		}
-		if err := validateHistoryContent(item["content"]); err != nil {
+		if err := b.sanitizeHistoryContent(item["content"], text(item["role"])); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -626,9 +704,22 @@ func (b *Bridge) translateHistory(input []any) ([]any, error) {
 	return result, nil
 }
 
-func validateHistoryContent(value any) error {
+// sanitizeHistoryContent validates the images of one content array and
+// rewrites, in place, every part BPS cannot carry (files, audio, other
+// provider parts) as text. Rejecting them would fail every later turn too,
+// because the client resends the part with the history. Parts that carry text
+// keep it; the rest become a note so the model knows something was omitted.
+func (b *Bridge) sanitizeHistoryContent(value any, role string) error {
 	content, _ := value.([]any)
-	for _, rawPart := range content {
+	textType := "input_text"
+	if role == "assistant" {
+		textType = "output_text"
+	}
+	for i, rawPart := range content {
+		if body, ok := rawPart.(string); ok {
+			content[i] = object{"type": textType, "text": body}
+			continue
+		}
 		part, _ := rawPart.(object)
 		switch text(part["type"]) {
 		case "input_text", "output_text", "text", "refusal":
@@ -636,11 +727,38 @@ func validateHistoryContent(value any) error {
 			if err := validateImage(part); err != nil {
 				return err
 			}
+		case "encrypted_content":
+			// Opaque context, such as an agent's encrypted task, is not text BPS
+			// can carry, and a note would silently drop the task. Plaintext was
+			// already recovered by NormalizeAgentMessage; the rest is refused so
+			// the gateway hands the request to the native path.
+			return fmt.Errorf("basispoints cannot carry encrypted content parts")
 		default:
-			return fmt.Errorf("basispoints supports text and HTTPS input_image content only")
+			if body := text(part["text"]); body != "" {
+				content[i] = object{"type": textType, "text": body}
+				continue
+			}
+			content[i] = object{"type": textType, "text": "[" + omittedPartLabel(part) + " omitted: Basispoints accepts only text and images]"}
+			b.omittedParts++
 		}
 	}
 	return nil
+}
+
+// omittedPartLabel names an unsupported content part for its replacement note.
+// Client-supplied names are quoted and truncated so they stay one short phrase.
+func omittedPartLabel(part object) string {
+	kind := text(part["type"])
+	if kind == "input_file" || kind == "file" {
+		if name := strings.TrimSpace(text(part["filename"])); name != "" {
+			return fmt.Sprintf("file %q", truncateRunes(name, 120))
+		}
+		return "file"
+	}
+	if kind == "" {
+		return "unsupported content"
+	}
+	return fmt.Sprintf("%q content", truncateRunes(kind, 40))
 }
 
 func isTool(item object) bool {
@@ -684,9 +802,9 @@ func (b *Bridge) translateCall(native object) (object, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, allowed := b.tools[toolName]
+	info, allowed := b.lookupTool(toolName)
 	if !allowed {
-		return nil, fmt.Errorf("basispoints returned a tool outside the client's catalog")
+		return nil, outsideCatalogError(toolName)
 	}
 	result, err := b.finishClientToolCall(native, info, envelope, marked)
 	if err != nil {
@@ -697,6 +815,42 @@ func (b *Bridge) translateCall(native object) (object, error) {
 	return result, nil
 }
 
+// lookupTool finds the catalog tool a model-written name refers to. Besides
+// the exact catalog name it accepts a host "functions." display prefix, and a
+// namespaced tool addressed by its bare name or by its namespace and name
+// joined without the dot, but only when exactly one tool matches. It never
+// picks between candidates.
+func (b *Bridge) lookupTool(name string) (tool, bool) {
+	if info, ok := b.tools[name]; ok {
+		return info, true
+	}
+	if trimmed := strings.TrimPrefix(name, "functions."); trimmed != name {
+		if info, ok := b.tools[trimmed]; ok {
+			return info, true
+		}
+		name = trimmed
+	}
+	if name == "" {
+		return tool{}, false
+	}
+	var match tool
+	matches := 0
+	for _, info := range b.tools {
+		if info.Namespace != "" && (info.Name == name || info.Namespace+info.Name == name) {
+			match = info
+			matches++
+		}
+	}
+	return match, matches == 1
+}
+
+// outsideCatalogError names the tool the model asked for, so the operator log
+// and the retry note both show which name failed. Tool names are schema-level
+// identifiers, never arguments.
+func outsideCatalogError(name string) error {
+	return fmt.Errorf("basispoints returned tool %q, which is not in the client's catalog; use an exact catalog tool name", truncateRunes(name, 64))
+}
+
 // translateDirectCatalogCall recovers a native tool call the model addressed by the
 // client tool's own name instead of through the run_officejs transport. Some turns
 // skip the wrapper and call the catalog tool directly; the reference plugins accept
@@ -705,13 +859,7 @@ func (b *Bridge) translateCall(native object) (object, error) {
 // (optionally carrying a host "functions." display prefix) are accepted; any other
 // native tool remains an unsupported-native-tool error.
 func (b *Bridge) translateDirectCatalogCall(native object) (object, error) {
-	name := text(native["name"])
-	info, ok := b.tools[name]
-	if !ok {
-		if trimmed := strings.TrimPrefix(name, "functions."); trimmed != name {
-			info, ok = b.tools[trimmed]
-		}
-	}
+	info, ok := b.lookupTool(text(native["name"]))
 	if !ok {
 		return nil, fmt.Errorf("basispoints returned an unsupported native tool; no tool was executed")
 	}
@@ -723,20 +871,24 @@ func (b *Bridge) translateDirectCatalogCall(native object) (object, error) {
 			return nil, fmt.Errorf("basispoints returned client function tool %q as a %q; no tool was executed", info.Name, kind)
 		}
 		envelope = object{"name": info.Name, "arguments": native["arguments"]}
-	case "local_shell", "shell", "apply_patch":
+	case "local_shell", "shell", "apply_patch", toolSearchKind:
 		if kind != "function_call" {
 			return nil, fmt.Errorf("basispoints returned built-in tool %q as a %q; no tool was executed", info.Name, kind)
 		}
 		envelope = object{"name": info.Name, "arguments": native["arguments"]}
 	case "custom":
-		if kind != "custom_tool_call" {
+		switch {
+		case kind == "custom_tool_call":
+			input, ok := native["input"].(string)
+			if !ok {
+				return nil, fmt.Errorf("basispoints direct custom tool input must be a string")
+			}
+			envelope = object{"name": info.Name, "input": input}
+		case kind == "function_call" && acceptsFunctionForm(info):
+			envelope = object{"name": info.Name, "arguments": native["arguments"]}
+		default:
 			return nil, fmt.Errorf("basispoints returned client custom tool %q as a %q; no tool was executed", info.Name, kind)
 		}
-		input, ok := native["input"].(string)
-		if !ok {
-			return nil, fmt.Errorf("basispoints direct custom tool input must be a string")
-		}
-		envelope = object{"name": info.Name, "input": input}
 	default:
 		return nil, fmt.Errorf("basispoints returned an unsupported native tool; no tool was executed")
 	}
@@ -791,6 +943,13 @@ func (b *Bridge) finishClientToolCall(native object, info tool, envelope object,
 	if id == "" {
 		return nil, fmt.Errorf("basispoints tool call is missing call_id")
 	}
+	if info.Kind == toolSearchKind {
+		args, err := envelopeArguments(envelope)
+		if err != nil {
+			return nil, err
+		}
+		return toolSearchCallItem(id, args)
+	}
 	if _, builtin := builtinClientTools[info.Kind]; builtin {
 		args, err := envelopeArguments(envelope)
 		if err != nil {
@@ -816,19 +975,12 @@ func (b *Bridge) finishClientToolCall(native object, info tool, envelope object,
 		result["namespace"] = info.Namespace
 	}
 	if info.Kind == "custom" {
-		value, hasInput := envelope["input"]
-		if alias, hasAlias := envelope["args"]; hasAlias {
-			if hasInput {
-				return nil, fmt.Errorf("basispoints custom tool envelope contains conflicting input fields")
-			}
-			value = alias
+		input, mapped, err := customToolInput(info, envelope)
+		if err != nil {
+			return nil, err
 		}
-		if _, exists := envelope["arguments"]; exists {
-			return nil, fmt.Errorf("basispoints custom tools require input text, not arguments")
-		}
-		input, ok := value.(string)
-		if !ok {
-			return nil, fmt.Errorf("basispoints custom tool input must be a string")
+		if mapped {
+			b.logf("relayed function-form %s call_id=%q as its custom tool call", info.Name, truncateRunes(id, 64))
 		}
 		result["type"] = "custom_tool_call"
 		result["id"] = "ctc_" + fingerprint(id)
@@ -855,6 +1007,102 @@ func (b *Bridge) finishClientToolCall(native object, info tool, envelope object,
 	return result, nil
 }
 
+// applyPatchTool is Codex's freeform patch tool. BPS models often address it
+// as a function with the patch in one argument; that form is relayed as the
+// custom call the client declared instead of being dropped.
+const (
+	applyPatchTool  = "apply_patch"
+	applyPatchBegin = "*** Begin Patch"
+)
+
+// acceptsFunctionForm reports whether a declared custom tool may arrive as a
+// function call and still be relayed as its custom call.
+func acceptsFunctionForm(info tool) bool {
+	return info.Kind == "custom" && info.Namespace == "" && info.Name == applyPatchTool
+}
+
+// customToolInput returns the text input of a custom tool envelope and whether
+// it was recovered from function-form arguments.
+func customToolInput(info tool, envelope object) (string, bool, error) {
+	value, hasInput := envelope["input"]
+	if alias, hasAlias := envelope["args"]; hasAlias {
+		if hasInput {
+			return "", false, fmt.Errorf("basispoints custom tool envelope contains conflicting input fields")
+		}
+		value, hasInput = alias, true
+	}
+	if arguments, exists := envelope["arguments"]; exists {
+		if !acceptsFunctionForm(info) {
+			return "", false, fmt.Errorf("basispoints custom tools require input text, not arguments")
+		}
+		if hasInput {
+			return "", false, fmt.Errorf("basispoints custom tool envelope contains conflicting input fields")
+		}
+		input, err := applyPatchInput(arguments)
+		return input, err == nil, err
+	}
+	if input, ok := value.(string); ok {
+		return input, false, nil
+	}
+	if hasInput && acceptsFunctionForm(info) {
+		input, err := applyPatchInput(value)
+		return input, err == nil, err
+	}
+	return "", false, fmt.Errorf("basispoints custom tool input must be a string")
+}
+
+// applyPatchInput recovers the patch text from function-form apply_patch
+// arguments: an object whose only field is input or patch, that object
+// encoded as JSON, or the bare patch text.
+func applyPatchInput(value any) (string, error) {
+	if raw, ok := value.(string); ok {
+		if strings.HasPrefix(strings.TrimSpace(raw), applyPatchBegin) {
+			return raw, nil
+		}
+		decoded, ok := decodeEnvelopeValue(strings.TrimSpace(raw))
+		if !ok {
+			return "", fmt.Errorf("basispoints apply_patch function arguments are neither JSON nor a patch (%s)", transportShape(raw))
+		}
+		value = decoded
+	}
+	switch v := value.(type) {
+	case string:
+		if strings.HasPrefix(strings.TrimSpace(v), applyPatchBegin) {
+			return v, nil
+		}
+	case object:
+		if len(v) == 1 {
+			for _, field := range []string{"input", "patch"} {
+				if input, ok := v[field].(string); ok {
+					return input, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("basispoints apply_patch function arguments must hold only a string input or patch field (fields=%s)", fieldNames(v))
+	}
+	return "", fmt.Errorf("basispoints apply_patch function arguments must be an object with the patch (%s)", transportShape(value))
+}
+
+// fieldNames lists an object's keys for operator logs. Keys are schema-level
+// names, never values; each is truncated and at most eight are listed.
+func fieldNames(value object) string {
+	names := make([]string, 0, len(value))
+	for name := range value {
+		names = append(names, truncateRunes(name, 32))
+	}
+	slices.Sort(names)
+	if len(names) > 8 {
+		names = append(names[:8], fmt.Sprintf("+%d", len(names)-8))
+	}
+	return fmt.Sprintf("%q", names)
+}
+
+// callShape identifies a native tool call in operator logs by its type, name
+// and call ID only; arguments can echo request content.
+func callShape(item object) string {
+	return fmt.Sprintf("type=%q name=%q call_id=%q", truncateRunes(text(item["type"]), 32), truncateRunes(text(item["name"]), 64), truncateRunes(text(item["call_id"]), 64))
+}
+
 // translateResponse converts the native tool calls of a completed response.
 // A call that cannot be relayed (an Excel-native tool, OfficeJS in the
 // transport, a malformed envelope) is dropped rather than failing the other
@@ -867,6 +1115,7 @@ func (b *Bridge) translateResponse(response object) error {
 	kept := make([]any, 0, len(output))
 	calls, dropped := 0, 0
 	answered := false
+	var reasons []string
 	for _, raw := range output {
 		item, _ := raw.(object)
 		if !isTool(item) {
@@ -878,13 +1127,16 @@ func (b *Bridge) translateResponse(response object) error {
 			continue
 		}
 		if calls > 0 && !b.Parallel {
-			log.Printf("[excel-bps] dropped an extra tool call because the client disabled parallel_tool_calls")
+			b.logf("dropped an extra tool call because the client disabled parallel_tool_calls (%s)", callShape(item))
 			continue
 		}
 		translated, err := b.translateCall(item)
 		if err != nil {
-			log.Printf("[excel-bps] dropped an untranslatable tool call: %v", err)
+			b.logf("dropped an untranslatable tool call (%s): %v", callShape(item), err)
 			dropped++
+			if len(reasons) < transportRetryReasons {
+				reasons = append(reasons, truncateRunes(fmt.Sprintf("%s: %v", callShape(item), err), 400))
+			}
 			continue
 		}
 		kept = append(kept, translated)
@@ -892,9 +1144,12 @@ func (b *Bridge) translateResponse(response object) error {
 	}
 	if dropped > 0 && calls == 0 && !answered {
 		// Nothing usable is left; fail so the client retries instead of
-		// ending the turn on an empty "successful" response.
-		return fmt.Errorf("basispoints response contained only tool calls that could not be relayed")
+		// ending the turn on an empty "successful" response. The retry tells
+		// the model why.
+		transportRetries.record(b.retryKey, reasons)
+		return fmt.Errorf("basispoints response contained only tool calls that could not be relayed (dropped=%d output_items=%d)", dropped, len(output))
 	}
+	transportRetries.forget(b.retryKey)
 	response["output"] = kept
 	response["reasoning"] = object{"effort": b.Effort}
 	response["parallel_tool_calls"] = b.Parallel

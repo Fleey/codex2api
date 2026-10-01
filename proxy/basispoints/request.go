@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,14 +34,40 @@ type Bridge struct {
 	scope            string
 	// skippedReferences counts item_reference inputs dropped from history.
 	skippedReferences int
+	// omittedParts counts history content parts replaced by a text note.
+	omittedParts int
 	// builtins lists declared built-in client tools (shell, apply_patch, ...)
 	// in declaration order, registered after the client's own tools.
 	builtins []string
 	// synthesized is set when a cut-off stream was completed locally.
 	synthesized atomic.Bool
+	// upstreamFailure holds the provider's unsuccessful terminal event.
+	upstreamFailure atomic.Pointer[TerminalFailure]
+	// translationFailure holds why the bridge itself failed the response.
+	translationFailure atomic.Pointer[string]
 	// keepalive overrides the idle interval between response.in_progress
 	// frames; zero uses defaultKeepalive.
 	keepalive time.Duration
+	// LogTag prefixes the bridge's operator log lines (account and request)
+	// so they can be matched with the gateway's request summary.
+	LogTag string
+	// sequenceStart is the first sequence_number the bridge emits.
+	sequenceStart int
+	// retryKey names this exact request (turn, iteration and history length),
+	// so a client retry of it can learn why the previous answer failed.
+	retryKey string
+	// toolsOff is tool_choice none, and allowedTools the allowed_tools
+	// subset; both also govern the tools a tool_search loaded.
+	toolsOff     bool
+	allowedTools map[string]bool
+}
+
+// logf writes one operator log line tagged with LogTag.
+func (b *Bridge) logf(format string, args ...any) {
+	if b != nil && b.LogTag != "" {
+		format = b.LogTag + " " + format
+	}
+	Logf(format, args...)
 }
 
 func decode(raw []byte, target any) error {
@@ -120,6 +148,12 @@ func describeOutputFormat(format object) (string, error) {
 
 // Prepare preserves the requested model and uses a whitelist for the Excel wire body.
 func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, error) {
+	return PrepareWithTag(raw, scope, replay, "")
+}
+
+// PrepareWithTag is Prepare with the bridge's LogTag set from the start, so
+// lines logged while the request is translated carry the request tag too.
+func PrepareWithTag(raw []byte, scope string, replay *ReplayCache, tag string) ([]byte, *Bridge, error) {
 	var source object
 	if err := decode(raw, &source); err != nil || source == nil {
 		return nil, nil, fmt.Errorf("invalid Basispoints request JSON")
@@ -143,8 +177,9 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 		effort = "medium"
 	}
 	parallel, explicit := source["parallel_tool_calls"].(bool)
-	b := &Bridge{RequestedEffort: requested, Effort: effort, Parallel: parallel || !explicit, tools: make(map[string]tool), unsupportedTools: make(map[string]bool), replay: replay, scope: scope}
+	b := &Bridge{RequestedEffort: requested, Effort: effort, Parallel: parallel || !explicit, tools: make(map[string]tool), unsupportedTools: make(map[string]bool), replay: replay, scope: scope, LogTag: tag}
 	choice := parseToolChoice(source["tool_choice"])
+	b.toolsOff, b.allowedTools = choice.none, choice.allowed
 	var catalog []any
 	if !choice.none {
 		catalog, err = b.collectTools(source["tools"], "")
@@ -166,6 +201,7 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	}
 	catalog = b.registerBuiltins(catalog)
 	catalog = b.restrictCatalog(catalog, choice.allowed)
+	b.summarizeCatalog(catalog)
 	var outputContract string
 	if config, ok := source["text"].(object); ok {
 		if f, ok := config["format"].(object); ok {
@@ -201,10 +237,16 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	turnEnd, iteration := agentTurnState(input)
 	taskID := fingerprint([]any{scope, conversation})
 	turnID := fingerprint([]any{scope, input[:turnEnd]})
+	b.retryKey = fingerprint([]any{turnID, iteration, len(input)})
 	replay.Prefetch(scope, historyCallIDs(input))
 	translated, err := b.translateHistory(input)
 	if err != nil {
 		return nil, nil, err
+	}
+	if note := transportRetries.note(b.retryKey); note != "" {
+		// Trailing, so the cached prefix of the failed request still matches.
+		translated = appendBeforeTrigger(translated, message("developer", note))
+		b.logf("told the model why its previous answer to this request could not be relayed")
 	}
 	prologue := make([]any, 0, 2)
 	if instructions := text(source["instructions"]); instructions != "" {
@@ -222,7 +264,7 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 			"set summary to codex2api.raw/CATALOG_NAME/FIELD and put the exact raw field value in code, with no JSON around it. " +
 			"For a custom tool, set summary to codex2api.custom/CATALOG_NAME and put the exact raw input directly in code. " +
 			parallelGuidance(b.Parallel) + "Never call an undeclared native tool or invent a tool result. " +
-			"Client tool catalog:\n" + describeCatalog(catalog) +
+			catalogNotes(catalog) + "Client tool catalog:\n" + describeCatalog(catalog) +
 			"\nEnd of catalog. The gateway handles run_officejs transport and does not execute Office code.\n" +
 			transportReminder
 		if requirement := choice.requirement(b.tools); requirement != "" {
@@ -238,6 +280,11 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 		b.Warnings = append(b.Warnings, warning)
 		protocol += "\nSome earlier conversation items were sent as references to stored responses, which this gateway cannot resolve, " +
 			"so they are missing from the history. Do not assume their content; ask the user if it matters."
+	}
+	if b.omittedParts > 0 {
+		warning := fmt.Sprintf("%d unsupported content parts were replaced with notes", b.omittedParts)
+		b.Warnings = append(b.Warnings, warning)
+		b.logf("%s", warning)
 	}
 	if len(b.unsupportedTools) > 0 {
 		kinds := make([]string, 0, len(b.unsupportedTools))
@@ -255,7 +302,7 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	output := object{
 		"model": model, "model_selection": "explicit", "stream": true, "store": false,
 		"input": append(prologue, translated...), "reasoning_effort": effort,
-		"context_management": []any{object{"type": "compaction", "compact_threshold": 200000}},
+		"context_management": []any{object{"type": "compaction", "compact_threshold": compactThreshold()}},
 		"metadata":           metadata,
 	}
 	if cacheKey != "" {
@@ -266,6 +313,50 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	}
 	body, err := json.Marshal(output)
 	return body, b, err
+}
+
+// compactThresholdEnv overrides, in tokens, the compaction threshold sent when
+// the client names no context_management of its own.
+const compactThresholdEnv = "CODEX_EXCEL_BPS_COMPACT_THRESHOLD"
+
+// ContextWindow is the most input the Excel backend accepts, in tokens:
+// measured by excel-codex-bridge for gpt-5.6-sol, gpt-6-sol, gpt-6-luna and
+// gpt-6-astra alike (918,843 accepted, ~921,375 refused with
+// context_length_exceeded), rounded down. BPS conversations run at this 1M
+// window. Codex compacts first, at AutoCompactTokenLimit (90%); the backend
+// compact_threshold (95%) is the fallback for a turn that outgrows that, and
+// stays under the window so the backend compacts instead of refusing.
+const (
+	ContextWindow         = 918000
+	AutoCompactTokenLimit = ContextWindow * 90 / 100 / 1000 * 1000
+)
+
+const (
+	defaultCompactThreshold = ContextWindow * 95 / 100 / 1000 * 1000
+	minCompactThreshold     = 10000
+	maxCompactThreshold     = defaultCompactThreshold
+)
+
+// compactThreshold returns the backend compaction threshold: the
+// CODEX_EXCEL_BPS_COMPACT_THRESHOLD override clamped to what the backend
+// accepts, or the default when it is unset or not a positive integer.
+func compactThreshold() int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(compactThresholdEnv)))
+	if err != nil || value <= 0 {
+		return defaultCompactThreshold
+	}
+	return min(max(value, minCompactThreshold), maxCompactThreshold)
+}
+
+// appendBeforeTrigger appends item to translated history, keeping a trailing
+// compaction_trigger last, where the backend expects it.
+func appendBeforeTrigger(items []any, item any) []any {
+	if n := len(items); n > 0 {
+		if last, _ := items[n-1].(object); text(last["type"]) == "compaction_trigger" {
+			return append(items[:n-1:n-1], item, last)
+		}
+	}
+	return append(items, item)
 }
 
 // agentTurnState returns the end of the turn prefix (through the last user
@@ -287,7 +378,7 @@ func agentTurnState(input []any) (int, int) {
 	inResults := false
 	for _, raw := range input[lastUser+1:] {
 		item, _ := raw.(object)
-		result := strings.HasSuffix(text(item["type"]), "_call_output")
+		result := strings.HasSuffix(text(item["type"]), "_call_output") || isToolSearchOutput(item)
 		if result && !inResults {
 			iteration++
 		}
@@ -318,6 +409,47 @@ func (b *Bridge) SynthesizedCompletion() bool {
 	return b != nil && b.synthesized.Load()
 }
 
+// TerminalFailure is a provider's unsuccessful terminal event.
+type TerminalFailure struct {
+	// Shape holds only the error code and type, so it may go to usage logs.
+	Shape string
+	// Raw is the event before sanitization. It can echo request content and
+	// belongs only in operator error logs.
+	Raw []byte
+	// RateLimit is the client-safe notice of a rate limit, or "" otherwise.
+	RateLimit string
+	// RetryAfter is the rate limit's retry delay, or 0 when unknown.
+	RetryAfter time.Duration
+	// ClientCode is the provider error code relayed to the client unchanged
+	// (see ClientError), or "" when the client gets a generic code.
+	ClientCode string
+}
+
+// UpstreamFailure returns the provider's unsuccessful terminal event, or the
+// zero value when there was none.
+func (b *Bridge) UpstreamFailure() TerminalFailure {
+	if b == nil {
+		return TerminalFailure{}
+	}
+	if failure := b.upstreamFailure.Load(); failure != nil {
+		return *failure
+	}
+	return TerminalFailure{}
+}
+
+// TranslationFailure returns why the bridge failed a response it could not
+// translate, or "" when it did not. The reason names only shapes and counts,
+// so it may go to usage logs.
+func (b *Bridge) TranslationFailure() string {
+	if b == nil {
+		return ""
+	}
+	if reason := b.translationFailure.Load(); reason != nil {
+		return *reason
+	}
+	return ""
+}
+
 // historyCallIDs lists the call IDs whose native items translation will look up.
 func historyCallIDs(input []any) []string {
 	var ids []string
@@ -326,7 +458,8 @@ func historyCallIDs(input []any) []string {
 		switch text(item["type"]) {
 		case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output",
 			"local_shell_call", "shell_call", "apply_patch_call",
-			"local_shell_call_output", "shell_call_output", "apply_patch_call_output":
+			"local_shell_call_output", "shell_call_output", "apply_patch_call_output",
+			toolSearchCallType, toolSearchOutputType, toolSearchCallOutputType:
 			ids = append(ids, text(item["call_id"]))
 		}
 	}
@@ -375,7 +508,7 @@ func parseToolChoice(value any) toolChoice {
 			return toolChoice{required: true}
 		}
 	case object:
-		if kind := text(v["type"]); builtinClientTools[kind].callType != "" {
+		if kind := text(v["type"]); builtinClientTools[kind].callType != "" || kind == toolSearchKind {
 			return toolChoice{required: true, name: kind}
 		}
 		switch text(v["type"]) {
@@ -390,7 +523,7 @@ func parseToolChoice(value any) toolChoice {
 			tools, _ := v["tools"].([]any)
 			for _, raw := range tools {
 				entry, _ := raw.(object)
-				if kind := text(entry["type"]); builtinClientTools[kind].callType != "" {
+				if kind := text(entry["type"]); builtinClientTools[kind].callType != "" || kind == toolSearchKind {
 					allowed[kind] = true
 				}
 				if name := text(entry["name"]); name != "" {

@@ -13,6 +13,10 @@ func describeCatalog(catalog []any) string {
 	for _, raw := range catalog {
 		// collectTools constructs every catalog entry as an object.
 		entry, _ := raw.(object)
+		if summarized, _ := entry[catalogSummaryKey].(bool); summarized {
+			lines = append(lines, describeSummary(entry))
+			continue
+		}
 		line := "Client tool " + quoted(entry["name"]) + " (" + text(entry["type"]) + ")."
 		if description := text(entry["description"]); description != "" {
 			line += " " + description
@@ -23,19 +27,26 @@ func describeCatalog(catalog []any) string {
 				line += " Input format: " + quoted(format) + "."
 			}
 		} else {
-			line += " Pass a JSON object in the envelope's arguments field. Argument contract: " + describeSchema(entry["parameters"], 0)
-			if field := text(entry[catalogRawFieldKey]); field != "" {
-				value := "the exact raw " + quoted(field) + " value"
-				if list, _ := entry[catalogRawListKey].(bool); list {
-					value = "exactly one raw " + quoted(field) + " entry (one command line)"
-				}
-				line += " Raw transport: set run_officejs summary to " + quoted(rawFieldTransportPrefix+text(entry["name"])+"/"+field) +
-					" and put " + value + " directly in code; other arguments keep their defaults."
-			}
+			line += " Pass a JSON object in the envelope's arguments field. Argument contract: " + describeSchema(entry["parameters"], 0) +
+				rawTransportNote(entry)
 		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n\n")
+}
+
+// rawTransportNote tells how to fill an entry's raw field, if it has one.
+func rawTransportNote(entry object) string {
+	field := text(entry[catalogRawFieldKey])
+	if field == "" {
+		return ""
+	}
+	value := "the exact raw " + quoted(field) + " value"
+	if list, _ := entry[catalogRawListKey].(bool); list {
+		value = "exactly one raw " + quoted(field) + " entry (one command line)"
+	}
+	return " Raw transport: set run_officejs summary to " + quoted(rawFieldTransportPrefix+text(entry["name"])+"/"+field) +
+		" and put " + value + " directly in code; other arguments keep their defaults."
 }
 
 func quoted(value any) string {
@@ -85,7 +96,8 @@ func describeSchema(value any, depth int) string {
 	constraints := make(object)
 	for key, value := range schema {
 		switch key {
-		case "type", "description", "properties", "items":
+		// title and $schema only label the schema for validators.
+		case "type", "description", "properties", "items", "title", "$schema":
 		default:
 			constraints[key] = value
 		}

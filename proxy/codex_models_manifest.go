@@ -44,8 +44,12 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	}
 	restrictManifest := codexManifestNeedsFiltering(row, account)
 	extraModels := h.extraRelayManifestModels(c.Request.Context(), row)
+	// Keys reaching BPS-enabled accounts may get the BPS context window,
+	// which rewrites the upstream body like a restriction does.
+	accounts := h.codexManifestAccounts(row)
+	excelBPS := anyExcelBPSAccount(accounts)
 	ifNoneMatch := c.GetHeader("If-None-Match")
-	if restrictManifest || len(extraModels) > 0 {
+	if restrictManifest || len(extraModels) > 0 || excelBPS {
 		// Restricted responses use a gateway ETag derived from the filtered
 		// or locally merged representation. It is not an upstream validator, and
 		// forwarding it can produce a body-less 304 that cannot be rebuilt safely.
@@ -86,6 +90,9 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 			return
 		}
 		h.learnManifestModelsAsync(manifest.Body, account)
+		if excelBPS {
+			body, _ = applyExcelBPSContextWindows(body, accounts)
+		}
 		h.writeMergedCodexManifest(c, body, "", extraModels)
 		return
 	}
@@ -100,7 +107,14 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	// 顺手把清单里注册表不认识的新模型学习进注册表（只增不改不删），
 	// 让选单里出现的新模型立即通过请求侧模型校验，无需等手动同步。
 	h.learnManifestModelsAsync(manifest.Body, account)
-	h.writeMergedCodexManifest(c, manifest.Body, manifest.ETag, extraModels)
+	body, etag := manifest.Body, manifest.ETag
+	if excelBPS {
+		var rewritten bool
+		if body, rewritten = applyExcelBPSContextWindows(body, accounts); rewritten {
+			etag = ""
+		}
+	}
+	h.writeMergedCodexManifest(c, body, etag, extraModels)
 }
 
 func (h *Handler) preferScopedCodexManifest(c *gin.Context) bool {

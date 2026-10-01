@@ -88,7 +88,7 @@ func isBuiltinCall(item object) bool {
 
 // isClientCall reports whether a translated item is a call the client runs.
 func isClientCall(item object) bool {
-	return isTool(item) || isBuiltinCall(item)
+	return isTool(item) || isBuiltinCall(item) || isToolSearchCall(item)
 }
 
 // registerBuiltins adds the built-in client tools the request declared. A

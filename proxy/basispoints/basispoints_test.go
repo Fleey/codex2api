@@ -2,9 +2,12 @@ package basispoints
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -165,6 +168,37 @@ func TestPrepareAcceptsInlineBase64Images(t *testing.T) {
 		if _, _, err := Prepare(bad, "account:1", &ReplayCache{}); err == nil {
 			t.Fatalf("Prepare accepted image_url %q", url)
 		}
+	}
+}
+
+func TestPrepareReplacesUnsupportedContentPartsWithNotes(t *testing.T) {
+	raw := `{"model":"gpt-5.5","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"summarize"},{"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,JVBERi0="}]},` +
+		`{"type":"message","role":"assistant","content":[{"type":"summary_text","text":"earlier answer"},{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]},` +
+		`{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_file","file_id":"file_1"}]},` +
+		`{"type":"message","role":"user","content":["plain part",{"type":"input_file","file_id":"file_2"}]}],` +
+		`"tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]}`
+	prepared, bridge := preparedBody(t, raw, &ReplayCache{})
+	body, _ := json.Marshal(prepared)
+	for _, want := range []string{
+		`[file \"report.pdf\" omitted: Basispoints accepts only text and images]`,
+		`{"text":"earlier answer","type":"output_text"}`,
+		`{"text":"[\"input_audio\" content omitted: Basispoints accepts only text and images]","type":"output_text"}`,
+		`{"text":"plain part","type":"input_text"}`,
+		`{"text":"[file omitted: Basispoints accepts only text and images]","type":"input_text"}`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("missing %s in %s", want, body)
+		}
+	}
+	for _, leaked := range []string{"input_file", "input_audio\"", "file_data", "JVBERi0", "summary_text"} {
+		if strings.Contains(string(body), leaked) {
+			t.Fatalf("unsupported part %s reached the wire: %s", leaked, body)
+		}
+	}
+	if len(bridge.Warnings) != 1 || !strings.Contains(bridge.Warnings[0], "4 unsupported content parts") {
+		t.Fatalf("warnings = %v", bridge.Warnings)
 	}
 }
 
@@ -497,6 +531,74 @@ func TestStreamFailsWhenEveryToolCallIsDroppedAndNothingElseRemains(t *testing.T
 	}
 }
 
+func TestStreamRecordsProviderErrorEventForLogs(t *testing.T) {
+	bridge := &Bridge{Effort: "medium", replay: &ReplayCache{}, tools: map[string]tool{}, unsupportedTools: map[string]bool{}}
+	converted := bridge.Stream(io.NopCloser(strings.NewReader("event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"secret detail\"}\n\n")))
+	defer converted.Close()
+	out, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatalf("read converted stream: %v", err)
+	}
+	if strings.Contains(string(out), "secret detail") || strings.Contains(string(out), "server_error") {
+		t.Fatalf("provider error reached the client: %s", out)
+	}
+	failure := bridge.UpstreamFailure()
+	if failure.Shape != `code="server_error" type="error"` || failure.RateLimit != "" {
+		t.Fatalf("UpstreamFailure = %+v", failure)
+	}
+	if !strings.Contains(string(failure.Raw), "secret detail") {
+		t.Fatalf("UpstreamFailure raw lost the provider event: %s", failure.Raw)
+	}
+}
+
+func TestStreamKeepsRateLimitCodeAndRetryDelayOnly(t *testing.T) {
+	event := `{"type":"error","error":{"type":"tokens","code":"rate_limit_exceeded","headers":{"retry-after":"1","retry-after-ms":"74","x-ratelimit-remaining-tokens":"0"},` +
+		`"message":"Rate limit reached for gpt-6-sol in organization org-synthetic on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 49361. Please try again in 74ms.","param":null},"sequence_number":2}`
+	bridge := &Bridge{Effort: "medium", replay: &ReplayCache{}, tools: map[string]tool{}, unsupportedTools: map[string]bool{}}
+	converted := bridge.Stream(io.NopCloser(strings.NewReader("event: error\ndata: " + event + "\n\n")))
+	defer converted.Close()
+	out, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatalf("read converted stream: %v", err)
+	}
+	for _, want := range []string{`"code":"rate_limit_exceeded"`, `"type":"tokens"`, "Please try again in 74ms."} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("missing %s in %s", want, out)
+		}
+	}
+	for _, leaked := range []string{"org-synthetic", "40000000", "49361", "x-ratelimit", "gpt-6-sol"} {
+		if strings.Contains(string(out), leaked) {
+			t.Fatalf("provider detail %q reached the client: %s", leaked, out)
+		}
+	}
+	if got := bridge.UpstreamFailure(); got.RateLimit != RateLimitMessage+" Please try again in 74ms." || got.RetryAfter != 74*time.Millisecond {
+		t.Fatalf("UpstreamFailure = %+v", got)
+	}
+}
+
+func TestRateLimitNoticeReadsRetryDelay(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After-Ms", "1500")
+	cases := []struct {
+		name   string
+		body   string
+		header http.Header
+		status int
+		want   string
+	}{
+		{"response header", `{"error":{"code":"rate_limit_exceeded"}}`, header, http.StatusTooManyRequests, RateLimitMessage + " Please try again in 1.5s."},
+		{"embedded retry-after", `{"error":{"code":"rate_limit_exceeded","headers":{"retry-after":"2"}}}`, nil, http.StatusOK, RateLimitMessage + " Please try again in 2s."},
+		{"message hint", `{"error":{"type":"rate_limit_error","message":"slow down. Please try again in 6.5s."}}`, nil, http.StatusOK, RateLimitMessage + " Please try again in 6.5s."},
+		{"bare 429", `not json`, nil, http.StatusTooManyRequests, RateLimitMessage},
+		{"other error", `{"error":{"code":"server_error","message":"try again in 1s"}}`, nil, http.StatusInternalServerError, ""},
+	}
+	for _, tc := range cases {
+		if got, _ := RateLimitNotice([]byte(tc.body), tc.header, tc.status); got != tc.want {
+			t.Fatalf("%s: RateLimitNotice = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestTerminalErrorShapeOmitsProviderMessages(t *testing.T) {
 	shape := TerminalErrorShape(object{"response": object{"error": object{"code": "invalid_prompt", "type": "invalid_request_error", "message": "echo of the user's secret prompt"}}})
 	if strings.Contains(shape, "secret") || !strings.Contains(shape, "invalid_prompt") {
@@ -813,5 +915,273 @@ func TestRewriteImagesKeepsUploadingAfterAnInvalidHistoryImage(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"file_id":"file-latest"`) || !strings.Contains(string(out), "the image data is invalid") {
 		t.Fatalf("latest image not uploaded or history image not noted: %s", out)
+	}
+}
+
+const applyPatchTools = `"tools":[` +
+	`{"type":"custom","name":"apply_patch","description":"Edit files","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},` +
+	`{"type":"custom","name":"other_custom","description":"Other"},` +
+	`{"type":"namespace","name":"mcp","tools":[{"type":"custom","name":"apply_patch","description":"Namespaced"}]}]`
+
+// streamItems returns the items of the response.output_item.done frames.
+func streamItems(t *testing.T, out string) []object {
+	t.Helper()
+	var items []object
+	for _, frame := range strings.Split(out, "\n\n") {
+		_, data, ok := strings.Cut(frame, "data: ")
+		if !ok {
+			continue
+		}
+		var payload object
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("decode frame %q: %v", data, err)
+		}
+		if payload["type"] == "response.output_item.done" {
+			item, _ := payload["item"].(object)
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previous)
+		log.SetFlags(flags)
+	})
+	return &buf
+}
+
+func TestFunctionFormApplyPatchIsRelayedAsCustomCall(t *testing.T) {
+	replay := &ReplayCache{}
+	_, bridge, err := Prepare([]byte(`{"model":"gpt-5.5","input":"edit",`+applyPatchTools+`}`), "account:1", replay)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	patch := "*** Begin Patch\n*** Add File: a.txt\n+say \"hi\" \\ there\n*** End Patch\n"
+	plain := "*** Begin Patch\n*** Add File: b.txt\n+plain\n*** End Patch"
+	quote := func(value any) string {
+		raw, _ := json.Marshal(value)
+		return string(raw)
+	}
+	encoded := func(args object) string { return quote(quote(args)) }
+	call := func(callID, name, arguments string) string {
+		return `{"type":"function_call","id":"fc_` + callID + `","call_id":"` + callID + `","name":"` + name + `","arguments":` + arguments + `}`
+	}
+	calls := []string{
+		call("c-json", "apply_patch", encoded(object{"input": patch})),
+		call("c-bare", "apply_patch", quote(patch)),
+		call("c-prefix", "functions.apply_patch", encoded(object{"patch": patch})),
+		// Raw line breaks inside the JSON string are repaired, as for transports.
+		call("c-raw-newlines", "apply_patch", quote(`{"input":"`+plain+`"}`)),
+		call("c-object", "apply_patch", quote(object{"input": patch})),
+		transportCall("c-env", "apply_patch", quote(object{"input": patch})),
+	}
+	want := map[string]string{"c-json": patch, "c-bare": patch, "c-prefix": patch, "c-raw-newlines": plain, "c-object": patch, "c-env": patch}
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" + strings.Join(calls, ",") + "]}}\n\n"
+	logs := captureLogs(t)
+	out := readStream(t, bridge, io.NopCloser(strings.NewReader(stream)))
+	if !strings.Contains(out, `"type":"response.completed"`) {
+		t.Fatalf("function-form apply_patch failed the response: %s\nlogs: %s", out, logs)
+	}
+	got := map[string]string{}
+	for _, item := range streamItems(t, out) {
+		if item["type"] != "custom_tool_call" || item["name"] != "apply_patch" {
+			t.Fatalf("relayed item is not a custom apply_patch call: %v", item)
+		}
+		got[text(item["call_id"])] = text(item["input"])
+	}
+	for id, input := range want {
+		if got[id] != input {
+			t.Fatalf("%s input = %q, want %q (all: %v)\nlogs: %s", id, got[id], input, got, logs)
+		}
+	}
+	if strings.Count(logs.String(), "relayed function-form apply_patch") != len(want) {
+		t.Fatalf("each mapped call should be logged once: %s", logs)
+	}
+
+	// The mapped call replays on the next turn as a transport item.
+	history := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"edit"}]},` +
+		`{"type":"custom_tool_call","call_id":"c-json","name":"apply_patch","input":` + quote(patch) + `},` +
+		`{"type":"custom_tool_call_output","call_id":"c-json","output":"Done"}]`
+	next, _ := preparedBody(t, `{"model":"gpt-5.5","input":`+history+`,`+applyPatchTools+`}`, replay)
+	if raw, _ := json.Marshal(next); !strings.Contains(string(raw), `"call_id":"c-json"`) || !strings.Contains(string(raw), "run_officejs") {
+		t.Fatalf("mapped apply_patch call was not replayed: %s", raw)
+	}
+}
+
+func TestFunctionFormIsRejectedForOtherCustomToolsAndAmbiguousPatches(t *testing.T) {
+	quote := func(value any) string {
+		raw, _ := json.Marshal(value)
+		return string(raw)
+	}
+	patch := "*** Begin Patch\n*** End Patch"
+	cases := map[string]string{
+		"other custom tool":     `{"type":"function_call","id":"fc_1","call_id":"c","name":"other_custom","arguments":` + quote(quote(object{"input": "x"})) + `}`,
+		"namespaced apply":      `{"type":"function_call","id":"fc_1","call_id":"c","name":"mcp.apply_patch","arguments":` + quote(quote(object{"input": patch})) + `}`,
+		"extra field":           `{"type":"function_call","id":"fc_1","call_id":"c","name":"apply_patch","arguments":` + quote(quote(object{"input": patch, "path": "a"})) + `}`,
+		"non-string input":      `{"type":"function_call","id":"fc_1","call_id":"c","name":"apply_patch","arguments":` + quote(quote(object{"input": 7})) + `}`,
+		"text is not a patch":   `{"type":"function_call","id":"fc_1","call_id":"c","name":"apply_patch","arguments":` + quote("rm -rf /") + `}`,
+		"envelope other custom": transportCall("c", "other_custom", quote(object{"input": "x"})),
+		"envelope both fields":  rawTransportCall("c", "s", `{"name":"apply_patch","input":"x","arguments":{"input":"*** Begin Patch\\n*** End Patch"}}`),
+	}
+	for name, item := range cases {
+		_, bridge, err := Prepare([]byte(`{"model":"gpt-5.5","input":"edit",`+applyPatchTools+`}`), "account:1", &ReplayCache{})
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		logs := captureLogs(t)
+		stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" + item + "]}}\n\n"
+		if out := readStream(t, bridge, io.NopCloser(strings.NewReader(stream))); !strings.Contains(out, `"type":"response.failed"`) || strings.Contains(out, "custom_tool_call") {
+			t.Fatalf("%s: call was relayed: %s", name, out)
+		}
+		if !strings.Contains(logs.String(), "dropped an untranslatable tool call (") {
+			t.Fatalf("%s: drop was not logged: %s", name, logs)
+		}
+		if strings.Contains(logs.String(), "rm -rf") || strings.Contains(logs.String(), "End Patch") {
+			t.Fatalf("%s: tool arguments reached the log: %s", name, logs)
+		}
+	}
+}
+
+func TestStreamLogsFailureCausesWithRequestTag(t *testing.T) {
+	logs := captureLogs(t)
+	newBridge := func() *Bridge {
+		return &Bridge{Effort: "medium", replay: &ReplayCache{}, tools: map[string]tool{}, unsupportedTools: map[string]bool{}, LogTag: "account=7 req=abcd"}
+	}
+	completed := func(output string) string {
+		return "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" + output + "]}}\n\n"
+	}
+
+	dropped := newBridge()
+	readStream(t, dropped, io.NopCloser(strings.NewReader(completed(`{"type":"function_call","id":"fc_1","call_id":"c","name":"excel_native","arguments":"{}"}`))))
+	if got, want := dropped.TranslationFailure(), "basispoints response contained only tool calls that could not be relayed (dropped=1 output_items=1)"; got != want {
+		t.Fatalf("TranslationFailure = %q, want %q", got, want)
+	}
+	if len(dropped.UpstreamFailure().Raw) != 0 {
+		t.Fatal("a local translation failure was recorded as a provider failure")
+	}
+	for _, want := range []string{
+		`[excel-bps] account=7 req=abcd dropped an untranslatable tool call (type="function_call" name="excel_native" call_id="c")`,
+		`could not be translated: basispoints response contained only tool calls that could not be relayed (dropped=1 output_items=1)`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("log is missing %q: %s", want, logs)
+		}
+	}
+
+	logs.Reset()
+	omitted := "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c\",\"name\":\"t\",\"arguments\":\"{}\"}}\n\n" + completed("")
+	readStream(t, newBridge(), io.NopCloser(strings.NewReader(omitted)))
+	if want := `omitted 1 streamed tool item(s); its output has 0 tool item(s); missing call_id="c" id="fc_1"`; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
+	}
+
+	logs.Reset()
+	readStream(t, newBridge(), io.NopCloser(strings.NewReader("event: response.created\ndata: not-json\n\n")))
+	if want := `invalid Basispoints SSE event (event="response.created" bytes=8)`; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
+	}
+
+	logs.Reset()
+	cut := "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n" +
+		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\",\"content\":[]}}\n\n"
+	converted := newBridge().Stream(io.NopCloser(strings.NewReader(cut)))
+	_, _ = io.ReadAll(converted)
+	converted.Close()
+	if want := `upstream stream ended before a terminal event (closed) and was left to the client retry: last finished item type="message" phase="commentary" does not end a turn`; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
+	}
+
+	logs.Reset()
+	bridge := newBridge()
+	readStream(t, bridge, io.NopCloser(strings.NewReader("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")))
+	if shape := bridge.UpstreamFailure().Shape; shape != `code="" type="response.incomplete" reason="max_output_tokens"` {
+		t.Fatalf("incomplete shape = %q", shape)
+	}
+	if want := `account=7 req=abcd upstream response.incomplete: code="" type="response.incomplete" reason="max_output_tokens"`; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
+	}
+}
+
+func TestTransportResolvesUnambiguousToolNameVariants(t *testing.T) {
+	tools := `"tools":[` +
+		`{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}},` +
+		`{"type":"namespace","name":"mcp__docs__","tools":[{"type":"function","name":"fetch","parameters":{"type":"object"}}]},` +
+		`{"type":"namespace","name":"github","tools":[{"type":"function","name":"search","parameters":{"type":"object"}}]},` +
+		`{"type":"namespace","name":"jira","tools":[{"type":"function","name":"search","parameters":{"type":"object"}}]}]`
+	completed := func(item string) string {
+		return "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" + item + "]}}\n\n"
+	}
+	relayed := map[string]struct{ call, name, namespace string }{
+		"functions prefix":     {transportCall("c1", "functions.exec_command", `{"cmd":"ls"}`), "exec_command", ""},
+		"bare namespaced name": {transportCall("c2", "fetch", `{}`), "fetch", "mcp__docs__"},
+		"joined namespace":     {transportCall("c3", "mcp__docs__fetch", `{}`), "fetch", "mcp__docs__"},
+		"raw prefixed":         {rawTransportCall("c4", "codex2api.raw/functions.exec_command/cmd", "ls -la"), "exec_command", ""},
+	}
+	for label, tc := range relayed {
+		_, bridge, err := Prepare([]byte(`{"model":"gpt-5.5","input":"go",`+tools+`}`), "account:1", &ReplayCache{})
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		out := readStream(t, bridge, io.NopCloser(strings.NewReader(completed(tc.call))))
+		if strings.Contains(out, `"type":"response.failed"`) || !strings.Contains(out, `"name":"`+tc.name+`"`) {
+			t.Fatalf("%s: call was not relayed as %q: %s", label, tc.name, out)
+		}
+		if tc.namespace != "" && !strings.Contains(out, `"namespace":"`+tc.namespace+`"`) {
+			t.Fatalf("%s: namespace %q missing: %s", label, tc.namespace, out)
+		}
+	}
+
+	rejected := map[string]string{
+		"ambiguous bare name": transportCall("c5", "search", `{}`),
+		"unknown name":        transportCall("c6", "shell_command", `{"cmd":"ls"}`),
+	}
+	for label, call := range rejected {
+		_, bridge, err := Prepare([]byte(`{"model":"gpt-5.5","input":"go",`+tools+`}`), "account:1", &ReplayCache{})
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		logs := captureLogs(t)
+		out := readStream(t, bridge, io.NopCloser(strings.NewReader(completed(call))))
+		if !strings.Contains(out, `"type":"response.failed"`) {
+			t.Fatalf("%s: call was relayed: %s", label, out)
+		}
+		if !strings.Contains(logs.String(), "which is not in the client's catalog") || !strings.Contains(bridge.TranslationFailure(), "could not be relayed") {
+			t.Fatalf("%s: failure was not explained: %s", label, logs)
+		}
+	}
+	logs := captureLogs(t)
+	_, bridge, _ := Prepare([]byte(`{"model":"gpt-5.5","input":"go",`+tools+`}`), "account:1", &ReplayCache{})
+	readStream(t, bridge, io.NopCloser(strings.NewReader(completed(transportCall("c7", "shell_command", `{"cmd":"ls"}`)))))
+	if want := `basispoints returned tool "shell_command", which is not in the client's catalog`; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
+	}
+}
+
+func TestPrepareWithTagTagsTheRetryNoteLine(t *testing.T) {
+	request := []byte(`{"model":"gpt-5.5","input":"tag the retry note",` + execCommandTools + `}`)
+	_, bridge, err := Prepare(request, "account:tag-test", &ReplayCache{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	failed := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" + transportCall("c", "no_such_tool", `{}`) + "]}}\n\n"
+	readStream(t, bridge, io.NopCloser(strings.NewReader(failed)))
+
+	logs := captureLogs(t)
+	prepared, retried, err := PrepareWithTag(request, "account:tag-test", &ReplayCache{}, "account=9 req=0000beef")
+	if err != nil {
+		t.Fatalf("PrepareWithTag: %v", err)
+	}
+	if retried.LogTag != "account=9 req=0000beef" || !strings.Contains(string(prepared), "no_such_tool") {
+		t.Fatalf("retry note missing or tag unset: tag=%q body=%s", retried.LogTag, prepared)
+	}
+	if want := "[excel-bps] account=9 req=0000beef told the model why its previous answer to this request could not be relayed"; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log is missing %q: %s", want, logs)
 	}
 }
