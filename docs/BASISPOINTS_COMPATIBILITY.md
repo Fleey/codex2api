@@ -39,6 +39,10 @@ BPS 后端实测最多接受约 918k 输入 token（excel-codex-bridge 对 gpt-5
 - 客户端自带 `context_management` 时原样保留；`CODEX_EXCEL_BPS_COMPACT_THRESHOLD` 仍可覆盖后端阈值，范围 10000–872000。
 - 长对话每轮发送的上下文更多，消耗的共享 TPM 额度也更多。已运行的 Codex（含桌面版 app-server）会沿用缓存的旧模型清单，重启后才按新窗口压缩。
 
+## User-Agent
+
+BPS 请求（Responses 与图片上传）的 User-Agent 跟随全局客户端身份设置，与同一账号、同一请求走原生 Codex 时发送的完全相同：设备画像稳定化、客户端兼容模式（`preserve` 透传官方客户端自己的 UA，`auto` / `force` 生成）、`codex_user_agent_config`（单画像或号池混合）依次生效。没有客户端请求的账号测试只按全局设置与账号生成。`CODEX_EXCEL_BPS_USER_AGENT` 设置时固定使用该值，优先于全局设置。
+
 ## 请求体大小
 
 请求体上限由全局 `CODEX_MAX_REQUEST_BODY_SIZE_MB`（默认 48）控制，按解压后大小计算。带图片的长对话在 Codex 自动压缩前就可能超过 64 MB；BPS 用户遇到 413 时可调大该值，并确保 `CODEX_REQUEST_MEMORY_BUDGET_MB` 不小于它。该上限对所有推理端点生效，调大前评估并发内存。

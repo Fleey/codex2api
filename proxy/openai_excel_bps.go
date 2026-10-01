@@ -182,19 +182,37 @@ var excelBPSClientHeaders = [][2]string{
 	{"X-Stainless-Runtime", "browser:chrome"},
 }
 
-// excelBPSUserAgentEnv overrides the browser User-Agent the add-in's WebView2
-// host would send, should the backend ever start checking it.
+// excelBPSUserAgentEnv pins the User-Agent of every Basispoints request,
+// overriding the global client identity settings.
 const excelBPSUserAgentEnv = "CODEX_EXCEL_BPS_USER_AGENT"
 
-// excelBPSDefaultUserAgent is desktop Excel's WebView2 (Edge) on Windows, the
-// host the PC/desktop client headers above describe.
-const excelBPSDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
+type excelBPSUserAgentKey struct{}
 
-func excelBPSUserAgent() string {
+// withExcelBPSUserAgent carries the User-Agent resolved for one client request
+// to every BPS request made for it: Responses and attachment uploads alike.
+func withExcelBPSUserAgent(ctx context.Context, userAgent string) context.Context {
+	return context.WithValue(ctx, excelBPSUserAgentKey{}, userAgent)
+}
+
+func excelBPSUserAgentFrom(ctx context.Context) string {
+	userAgent, _ := ctx.Value(excelBPSUserAgentKey{}).(string)
+	return userAgent
+}
+
+// resolveExcelBPSUserAgent returns the User-Agent BPS requests send: the
+// CODEX_EXCEL_BPS_USER_AGENT override, else the one the global client identity
+// settings (codex_user_agent_config, client compatibility, device profile)
+// give this account and client request, exactly as its native Codex requests
+// send it, so an account presents one client on both paths.
+func resolveExcelBPSUserAgent(account *auth.Account, apiKey string, deviceCfg *DeviceProfileConfig, downstream http.Header) string {
 	if value := strings.TrimSpace(os.Getenv(excelBPSUserAgentEnv)); value != "" {
 		return value
 	}
-	return excelBPSDefaultUserAgent
+	if downstream == nil {
+		downstream = http.Header{}
+	}
+	userAgent, _ := ResolveCodexOutboundClientHeaders(account, apiKey, deviceCfg, downstream)
+	return userAgent
 }
 
 // setExcelBPSHeaders applies the account credentials and the Excel add-in
@@ -210,7 +228,11 @@ func setExcelBPSHeaders(req *http.Request, token, accountID string) {
 		req.Header.Set("X-Openai-Account-User-Id", claims.ChatGPTAccountUserID)
 	}
 	req.Header.Set("Origin", "https://bps.openai.com")
-	req.Header.Set("User-Agent", excelBPSUserAgent())
+	userAgent := excelBPSUserAgentFrom(req.Context())
+	if userAgent == "" {
+		userAgent = resolveExcelBPSUserAgent(nil, "", nil, nil)
+	}
+	req.Header.Set("User-Agent", userAgent)
 	for _, header := range excelBPSClientHeaders {
 		req.Header.Set(header[0], header[1])
 	}
@@ -476,6 +498,11 @@ func prepareExcelBPSUpstream(ctx context.Context, account *auth.Account, raw []b
 	if account == nil || !account.IsExcelBPSEnabled() {
 		basispoints.Logf("%s is not enabled for Basispoints", tag)
 		return nil, &excelBPSFailure{status: http.StatusBadRequest, code: "disabled"}
+	}
+	if excelBPSUserAgentFrom(ctx) == "" {
+		// Callers without a client request (account tests) take the
+		// account's identity from the global settings alone.
+		ctx = withExcelBPSUserAgent(ctx, resolveExcelBPSUserAgent(account, "", nil, nil))
 	}
 	token := account.GetAccessToken()
 	if token == "" {
@@ -1330,7 +1357,14 @@ func (h *Handler) handleExcelBPS(c *gin.Context, account *auth.Account, raw []by
 			return false
 		}
 	}
-	result, err := forwardExcelBPS(c.Request.Context(), c, account, raw, scope, threadKey, proxyURL, compact, stream, persistReplay)
+	// The BPS requests present the client native Codex requests would.
+	apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+	var deviceCfg *DeviceProfileConfig
+	if h != nil {
+		deviceCfg = h.deviceCfg
+	}
+	ctx := withExcelBPSUserAgent(c.Request.Context(), resolveExcelBPSUserAgent(account, apiKey, deviceCfg, c.Request.Header.Clone()))
+	result, err := forwardExcelBPS(ctx, c, account, raw, scope, threadKey, proxyURL, compact, stream, persistReplay)
 	if result.DurationMs == 0 && !start.IsZero() {
 		result.DurationMs = int(max(int64(0), time.Since(start).Milliseconds()))
 	}

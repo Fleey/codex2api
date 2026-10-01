@@ -278,27 +278,77 @@ func TestExcelBPSRemembersRefusedInlineToolImages(t *testing.T) {
 	}
 }
 
-func TestExcelBPSSendsAccountUserIDAndBrowserUserAgent(t *testing.T) {
+func TestExcelBPSSendsAccountUserIDAndOverriddenUserAgent(t *testing.T) {
 	segment := func(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }
 	token := segment(`{"alg":"none"}`) + "." +
 		segment(`{"https://api.openai.com/auth":{"chatgpt_account_id":"chatgpt-account","chatgpt_account_user_id":"user-synthetic__chatgpt-account"}}`) + ".sig"
-	for _, tc := range []struct {
-		token, userAgent, wantUser, wantAgent string
-	}{
-		{token: token, wantUser: "user-synthetic__chatgpt-account", wantAgent: excelBPSDefaultUserAgent},
-		{token: "synthetic-access-token", userAgent: "Custom/1.0", wantAgent: "Custom/1.0"},
-	} {
-		t.Setenv(excelBPSUserAgentEnv, tc.userAgent)
-		request := httptest.NewRequest(http.MethodPost, basispoints.ResponsesURL, nil)
-		setExcelBPSHeaders(request, tc.token, "chatgpt-account")
-		if got := request.Header.Get("X-Openai-Account-User-Id"); got != tc.wantUser {
-			t.Fatalf("X-Openai-Account-User-Id = %q, want %q", got, tc.wantUser)
-		}
-		if got := request.Header.Get("User-Agent"); got != tc.wantAgent {
-			t.Fatalf("User-Agent = %q, want %q", got, tc.wantAgent)
-		}
+	request := httptest.NewRequest(http.MethodPost, basispoints.ResponsesURL, nil)
+	request = request.WithContext(withExcelBPSUserAgent(request.Context(), "codex-tui/9.9.9"))
+	setExcelBPSHeaders(request, token, "chatgpt-account")
+	if got := request.Header.Get("X-Openai-Account-User-Id"); got != "user-synthetic__chatgpt-account" {
+		t.Fatalf("X-Openai-Account-User-Id = %q", got)
 	}
-	if !strings.Contains(excelBPSDefaultUserAgent, "Windows NT") || !strings.Contains(excelBPSDefaultUserAgent, "Edg/") {
-		t.Fatalf("default User-Agent does not describe desktop Excel's WebView2: %s", excelBPSDefaultUserAgent)
+	if got := request.Header.Get("User-Agent"); got != "codex-tui/9.9.9" {
+		t.Fatalf("User-Agent = %q, want the resolved one", got)
+	}
+	t.Setenv(excelBPSUserAgentEnv, "Custom/1.0")
+	if got := resolveExcelBPSUserAgent(testExcelBPSAccount(), "", nil, nil); got != "Custom/1.0" {
+		t.Fatalf("CODEX_EXCEL_BPS_USER_AGENT did not win: %q", got)
+	}
+}
+
+// BPS requests present the client the global identity settings give the
+// account, the same User-Agent its native Codex requests send.
+func TestExcelBPSUserAgentFollowsGlobalClientIdentity(t *testing.T) {
+	t.Setenv("LOG_DISABLED", "true")
+	gin.SetMode(gin.TestMode)
+	prev := CurrentRuntimeSettings()
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"client_name":"codex-tui","client_version":"0.142.0-alpha.10","os_name":"Mac OS","os_version":"13.7.8","arch":"arm64","terminal":"xterm-256color"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON: %v", err)
+	}
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModeForce, CodexUserAgentConfig: normalized})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	const want = "codex-tui/0.142.0-alpha.10 (Mac OS 13.7.8; arm64) xterm-256color (codex-tui; 0.142.0-alpha.10)"
+
+	previous := excelBPSDo
+	t.Cleanup(func() { excelBPSDo = previous })
+	var agents []string
+	excelBPSDo = func(req *http.Request, _ *auth.Account, _ string) (*http.Response, error) {
+		agents = append(agents, req.Header.Get("User-Agent"))
+		body := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	raw := `{"model":"gpt-5.5","input":"hello","stream":true}`
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+	ctx.Request.Header.Set("User-Agent", "codex-tui/0.100.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.100.0)")
+	(&Handler{}).handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/"+t.Name(), "thread:1", "", false, true, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+	native, _ := ResolveCodexOutboundClientHeaders(testExcelBPSAccount(), "", nil, ctx.Request.Header)
+	if len(agents) != 1 || agents[0] != want || agents[0] != native {
+		t.Fatalf("client request User-Agent = %q, want %q (native %q)", agents, want, native)
+	}
+
+	// In preserve mode an official client's own User-Agent goes through, as
+	// on the native path; this needs the client's headers to reach BPS.
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModePreserve, CodexUserAgentConfig: normalized})
+	agents = nil
+	(&Handler{}).handleExcelBPS(ctx, testExcelBPSAccount(), []byte(raw), "account:91/"+t.Name()+"/preserve", "thread:1", "", false, true, false, "/v1/responses", "gpt-5.5", "gpt-5.5", "", "", auth.SessionAffinityGuard{}, time.Now())
+	if downstream := ctx.Request.Header.Get("User-Agent"); len(agents) != 1 || agents[0] != downstream {
+		t.Fatalf("preserve mode User-Agent = %q, want the client's %q", agents, downstream)
+	}
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModeForce, CodexUserAgentConfig: normalized})
+
+	// Account tests have no client request; the global settings still apply.
+	agents = nil
+	response, err := ExecuteExcelBPSRequest(t.Context(), testExcelBPSAccount(), []byte(raw), "account:91/"+t.Name()+"/test", "thread:2", "", false)
+	if err != nil {
+		t.Fatalf("ExecuteExcelBPSRequest: %v", err)
+	}
+	response.Response.Body.Close()
+	if len(agents) != 1 || agents[0] != want {
+		t.Fatalf("account test User-Agent = %q, want %q", agents, want)
 	}
 }
